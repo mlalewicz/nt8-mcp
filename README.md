@@ -29,7 +29,7 @@ nt8 health                                                         # NT8 running
 Needs Windows, NinjaTrader 8 (a free Simulator install is enough) and Python 3.10+. Details:
 [Requirements](#requirements) and [Install](#install).
 
-<!-- demo gif: docs/demo.gif -->
+![nt8-mcp demo](docs/demo.gif)
 
 ## What can I ask it?
 
