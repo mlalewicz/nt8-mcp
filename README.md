@@ -20,10 +20,11 @@ by default. Not affiliated with NinjaTrader, LLC.
 ## Quick start
 
 ```
-powershell -ExecutionPolicy Bypass -File scripts\install-addon.ps1   # then press F5 in the NinjaScript Editor once
+powershell -ExecutionPolicy Bypass -File scripts\install-addon.ps1
+# then press F5 in the NinjaScript Editor once
 pip install -e server
 claude mcp add --scope user nt8 -- nt8-mcp
-nt8 health                                                         # NT8 running -> AddOn + NT8 version, connections
+nt8 health   # NT8 running -> AddOn + NT8 version, connections
 ```
 
 Needs Windows, NinjaTrader 8 (a free Simulator install is enough) and Python 3.10+. Details:
@@ -42,6 +43,11 @@ Needs Windows, NinjaTrader 8 (a free Simulator install is enough) and Python 3.1
 - *"Which days of NQ tick and minute data do I have locally? Download the missing minute days for
   last month."*
 - *"What is the real signature of `Draw.Line`? Check before you write the call."*
+- *"Lint my strategy folder for NinjaScript hazards before I put it on Sim."*
+- *"Match the Strategy Analyzer trades of my strategy against my research trade list and tell me
+  the match rate per entry."*
+- *"NinjaTrader crashed. Which Sim legs are off, which orders are orphaned, and what does the
+  trace say before the crash?"*
 
 ## How it works
 
@@ -52,7 +58,7 @@ Needs Windows, NinjaTrader 8 (a free Simulator install is enough) and Python 3.1
                  |  MCP
                  v
 +----------------------------------------------------------+
-|  nt8-mcp  (Python MCP server: 79 tools + the nt8 CLI)    |
+|  nt8-mcp  (Python MCP server: 89 tools + the nt8 CLI)    |
 +----------------------------------------------------------+
                  |  HTTP on localhost:7891
                  v
@@ -102,6 +108,12 @@ Needs Windows, NinjaTrader 8 (a free Simulator install is enough) and Python 3.1
 - **A truth check on the tool itself.** `nt_health`, `nt_status` and `nt_compat` tell the assistant
   which build is running, if it is older than your source, and which NinjaTrader internals an
   upgrade broke — so it does not debug code that is not the code that is running.
+- **A Sim desk.** After a crash: one status read of the Strategies grid (expected legs, duplicates,
+  orphaned orders, legs silent past their decision time), then gated repairs — cancel orphaned
+  orders, remove dead rows, re-enable allowlisted legs. Simulator/Playback only, off by default —
+  see [Sim desk](#sim-desk-repair-the-strategies-grid-after-a-crash-opt-in).
+- **Lint and trade match.** `nt_lint` scans NinjaScript for hazards before it runs; `nt_match`
+  checks NinjaTrader's trades against a research trade list, per entry, with a PASS/FAIL gate.
 - **A shell CLI.** Every tool is also a command: `nt8 health`, `nt8 bars --chart first --n 5`.
 
 ## Why this one, for development
@@ -123,7 +135,7 @@ about the edit-compile-look-fix loop.
    account. So no order can go to a live, funded or broker-demo account, and the two
    account-changing features are off by default, on disk, in every clone (see
    [Order entry: Simulator only, off by default](#order-entry-simulator-only-off-by-default) and the [Safety model](#safety-model)).
-6. **It is MCP-native.** 79 typed tools with docstrings written for a model, grouped by module. No
+6. **It is MCP-native.** 89 typed tools with docstrings written for a model, grouped by module. No
    bespoke IPC layer, no prompt glue.
 7. **It closes the loop.** Build, compile, backtest, run on Sim or in a replay, and compare the
    fills (the simulation bench above).
@@ -187,13 +199,13 @@ for all of that. The order module (`nt_order_submit`, `nt_order_bracket`, `nt_or
 `nt_order_cancel`, `nt_position_close`, `nt_position_reverse`) is its own file, and these are its
 gates:
 
-- an arming file, `orders.enabled`, that you create by hand; ignored again after 24 hours. The ops
-  module's file does not arm it, and its file does not arm the ops module — the same file also
-  arms ATM strategies, strategies-on-Sim and the Playback controls below;
+- an arming file, `orders.enabled`, that you create by hand and delete to disarm — it does not
+  expire. The ops module's file does not arm it, and its file does not arm the ops module — the
+  same file also arms ATM strategies, strategies-on-Sim and the Playback controls below;
 - Simulator and Playback accounts only, judged by the connection's provider and never by the
-  account's name. The Backtest account is refused too;
-- refused while any connection that can route orders to a real broker is up. A broker *demo*
-  counts as real, on purpose;
+  account's name. The Backtest account is refused too — and this is what keeps real money out of
+  reach, whatever connections are up: a broker connection that can route orders is often a
+  Simulator account's own price feed, so this module never refuses just because one is Connected;
 - a dry run first, then a signed confirm string that works once, within 30 seconds, for exactly
   the order the dry run showed;
 - hard caps: 10 contracts per order, 20 working orders per account, 60 orders per minute. A config
@@ -294,7 +306,7 @@ AddOn passthroughs (need NT8 open with the AddOn compiled in), grouped by the mo
 | `nt_indicators(chart, name="", n=1)` | Indicators, their inputs, last n plot values |
 | `nt_drawings(chart)` | Drawing objects on the chart |
 | `nt_chart_reload(chart)` | Reload NinjaScript on the chart (not the assembly — that's `nt_reload_assembly`) |
-| `nt_account(name="")` | Read-only account state (cash, P&L, positions, orders); no name = all accounts |
+| `nt_account(name="")` | Read-only account state (cash, P&L, positions, orders, each order's owning strategy id and alive/dead); no name = all accounts |
 | `nt_bridge_log(n=100)` | Tail of the AddOn's own request/error log |
 | `nt_screenshot(chart="first")` | PNG of the chart window |
 | `nt_status()` | Is the running assembly newer than the newest `.cs` on disk (`GET /ntstatus`), plus an out-of-band check from Python: the newest `.cs` date on disk against the build time, and the installed AddOn files against the repo's. It reports a `disagreement` when the AddOn says it is fresh and the disk says it is not, so a stale AddOn cannot vouch for itself |
@@ -343,6 +355,7 @@ Event rings: they answer even with the Output window closed or the UI thread wed
 | `nt_backtest_status(id)` | Status of one backtest (state, and once done, summary + trades) |
 | `nt_backtests()` | List all backtests (id, strategy, instrument, period, state) |
 | `nt_backtest_cancel(id)` | Cancel a running backtest |
+| `nt_match(reference_csv, nt8_trades=None, backtest=None, backtest_id="", run_id="", columns=None, entry_tol_min=5, price_tol_ticks=1, bars_csv="", threshold=95.0, gate="date_side", ...)` | Match NT8's trades to a research trade list per entry: % on date + side and on full outcome, same-bar ambiguous exits, news minutes, per-mismatch table, PASS/FAIL (`docs/api/match.md`) |
 
 `nt_backtest` runs a strategy through the AddOn's headless Strategy Analyzer pass, on the
 **Backtest account only** — no Sim or live account is ever touched. Strategies that read the tape in
@@ -363,7 +376,8 @@ same instrument and window first: it tells a data problem from a strategy proble
 Example:
 
 ```python
-nt_backtest("SampleMACrossOver", chart="first", from_date="2026-09-15", to_date="2026-09-17")
+nt_backtest("SampleMACrossOver", chart="first",
+            from_date="2026-09-15", to_date="2026-09-17")
 ```
 
 ### Optimize / walk-forward / report
@@ -465,6 +479,7 @@ These touch the filesystem and NT8's own windows directly.
 | `nt_install_addon()` | Install the whole NT8Bridge AddOn: delete orphan `NT8Bridge*.cs`, copy every current one in |
 | `nt_shot(title="", out="")` | Screenshot any top-level window by title substring (or the whole screen), via `PrintWindow` |
 | `nt_trace(n=100)` | Tail of NT8's newest trace file and newest log file |
+| `nt_lint(paths, rules=None)` | Static hazard scan of `.cs` files (read-only): cross-instrument series in indicators, depth on a pool thread, `Thread.Abort`, unguarded file writes, network calls, strategies that never cancel their own orders on disable, Print spam, Process/Registry/Delete/Exit, sync `Dispatcher.Invoke`, hidden text. Per finding: rule, line, severity, fix hint. Also `python scripts/nt_lint.py`. Rules: `docs/api/lint.md` |
 
 `nt_shot` and `nt_window_shot` both capture with `PrintWindow` and never front or restore the
 target. `scripts/shot.ps1` (front-and-restore) is kept as a fallback for the rare window
@@ -478,8 +493,8 @@ default, on disk, in every clone. Full contract: `docs/api/orders.md`. The reaso
 
 **How to arm it.** Create an empty file named `orders.enabled` in
 `%USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\AddOns\`. No recompile, no NT8 restart. Every
-`/orders/*` endpoint answers `403 {"error":"orders module not armed"}` until that file exists and
-is younger than 24 h. Delete the file to disarm. `ops.enabled` does not arm this module.
+`/orders/*` endpoint answers `403 {"error":"orders module not armed"}` until that file exists.
+Delete the file to disarm — it does not expire on its own. `ops.enabled` does not arm this module.
 
 | Tool | Does |
 |---|---|
@@ -529,15 +544,64 @@ Playback account and read the fills back. Same arming file as the order module
 
 | Tool | Does |
 |---|---|
-| `nt_strategy_start(strategy, account, instrument, bars_period, inputs=None, days_to_load=None, confirm=None, issued_at=None)` | Add a strategy to NinjaTrader's own Control Center Strategies grid, enabled, on a Simulator/Playback account |
+| `nt_strategy_start(strategy, account, instrument, bars_period, inputs=None, days_to_load=None, break_at_eod=None, trading_hours=None, confirm=None, issued_at=None)` | Add a strategy to NinjaTrader's own Control Center Strategies grid, enabled, on a Simulator/Playback account |
 | `nt_strategy_stop(id, account, confirm=None, issued_at=None)` | Disable the strategy and remove its grid row; reports the position and working orders left behind. It does not flatten |
 | `nt_strategy_runs()` | State, position, working orders and realized P&L for the strategies this server started |
 
-The strategy is added to NinjaTrader's own grid, so the user always sees the row and can disable
-it by hand. After a NinjaScript reload the module no longer knows the ids of the instances it
-started — they keep running and keep their grid row, and are disabled there by hand; the grid row
-is the safety feature, not a nicety. Use `nt_position_close` to flatten what a stopped strategy
-left behind.
+`break_at_eod` (default `true`, the same default a chartless backtest uses) and `trading_hours`
+(a template name; omit for the instrument's own) are the Strategies dialog's own "Break at EOD" and
+trading-hours settings — omitting `break_at_eod` can drift 10/30/60-minute bars off the hour after
+an early close. The strategy is added to NinjaTrader's own grid, so the user always sees the row
+and can disable it by hand. A NinjaScript reload starts the module with an empty registry, but the
+first call after it takes each run back under its original id, from a file written on every start
+and stop, as long as an instance with that run's strategy id is still running on the same
+Simulator or Playback account; otherwise the grid row survives and is disabled there by hand — the
+grid row is the safety feature, not a nicety. Use `nt_position_close` to flatten what a stopped
+strategy left behind.
+
+## Sim desk: repair the Strategies grid after a crash (opt-in)
+
+After a platform crash every strategy comes back disabled; re-enabling by hand can also turn on
+stale rows, and a strategy disabled with `CancelEntriesOnStrategyDisable=false` leaves its working
+orders behind with nobody managing them. These tools find and clean that up. Same arming file
+(`orders.enabled`) and the same gate chain as the order module: Simulator/Playback accounts only,
+dry run, then a signed one-shot confirm. Full contract: `docs/api/desk.md`.
+
+| Tool | Does |
+|---|---|
+| `nt_lock(caller, minutes=30, release=False)` | Take, renew or release the local NT8 lock the three writes below require |
+| `nt_cancel_orphans(caller, account, instrument=None, confirm=None, issued_at=None)` | Cancel every working order whose owning strategy instance is dead |
+| `nt_grid_remove(caller, strategy_id, account, confirm=None, issued_at=None)` | Remove one disabled, dead grid row this server did not start |
+| `nt_grid_enable(caller, strategy_id, account, confirm=None, issued_at=None)` | Re-enable one existing grid row, only if it is in the allowlist file; refuses duplicates |
+| `nt_desk_recover(caller, account=None, confirm=None, issued_at=None)` | After a restart: re-enable every allowlisted leg that is off, one row per leg, under one plan and one confirm; refuses a leg with 0 or 2+ candidate rows |
+| `nt_desk_status()` | One read: process start, last Session Break, connections, expected legs vs enabled vs Realtime, duplicates, orphans, trace age, legs silent past their decision time |
+| `nt_leg_decisions(strategy=None, days=5)` | Each leg's last decision lines from its own CSV, with a "no line today" flag past its decision time |
+| `nt_crash_report(n=100)` | Trace lines before the last Session Break, plus Windows crash events around it |
+
+**The lock.** The three writes take a `caller` name and send nothing unless
+`Documents\NinjaTrader 8\nt8mcp\nt8.lock` (`{"holder", "expires"}`; `NT8MCP_LOCK_FILE` overrides)
+names that caller and has not expired. It coordinates agents that share one NinjaTrader; it is not
+a security gate. **The allowlist.** `nt_grid_enable` is refused unless
+`Documents\NinjaTrader 8\nt8mcp\desk_legs.json` exists (`NT8MCP_DESK_LEGS` in NinjaTrader's own
+environment overrides) and lists the row's (strategy, account, instrument). The same file is the
+list of expected legs for `nt_desk_status`:
+
+```json
+{"legs": [{"strategy": "<StrategyTypeName>",
+           "account": "<AccountName>",
+           "instrument": "ES 12-26", "qty": 1,
+           "decision_time": "09:35"}]}
+```
+
+`decision_time` is optional (`"HH:MM"`, Eastern). With it, `nt_leg_decisions` and `nt_desk_status`
+flag the leg when that time has passed on a weekday and its file
+`Documents\NinjaTrader 8\nt8mcp\decisions\<strategy>_<account>.csv` (`NT8MCP_DECISIONS_DIR`
+overrides the folder) has no line for today. The strategy writes that file, one line per session:
+`date_et,time_et,decision,reason,inputs`.
+
+Grid rows (`nt_strategies_running`) now carry `strategyId`, `liveState`, `instanceAlive` and
+`startedByBridge`; order rows in `nt_account` and the `nt_order_cancel` plan carry the owner's
+`ownerStrategyId`, `ownerState` and `ownerAlive`.
 
 ## ATM strategies (opt-in, Simulator only)
 
@@ -615,11 +679,12 @@ disable a strategy, or switch a live chart's series. It can only reduce exposure
 order entry is a separate opt-in module with its own arming file; see
 [Order module](#order-module-opt-in-simulator-only).) `Account.FlattenEverything()` is never
 called — every action names one account. A non-Simulator account is never even listed as a
-target unless a second file, `ops.live`, is present (this repository never creates it). Only the
-two POSTs, `/ops/flatten` and `/ops/reconnect` (and `nt_flatten`), are refused outright while any
-live, order-routing connection is up; `GET /ops/status` is a read and is deliberately not behind
-that guard — it answers 200 and reports `anyLive:true` while a live connection is up. Every armed
-call, successful or not, is appended to an audit log
+target unless a second file, `ops.live`, is present (this repository never creates it).
+`/ops/reconnect` (and, for a non-Simulator/Playback account only, `/ops/flatten` and `nt_flatten`)
+are refused outright while any live, order-routing connection is up — a Simulator or Playback
+account can be flattened whatever connection is up. `GET /ops/status` is a read and is deliberately
+not behind that guard — it answers 200 and reports `anyLive:true` while a live connection is up.
+Every armed call, successful or not, is appended to an audit log
 (`Documents\NinjaTrader 8\nt8mcp\ops.jsonl`).
 
 **The manual Sim flatten test.** No automated run in this repository opens a live position, so the
@@ -643,15 +708,18 @@ between dry-run and confirm) are covered by the automated test suite instead of 
 - **Backtests use the Backtest account only.** A request that names another account is refused.
 - **Local only.** The AddOn listens on `localhost:7891`. Nothing is sent to any server by this
   project; your code, charts and account data stay on your machine.
-- **Two opt-in files, each armed by an empty file you create by hand**, each ignored again
-  after 24 hours: `orders.enabled` and `ops.enabled`. No tool, script or test in this repository
-  creates either file for you. `orders.enabled` now arms four things behind one file: order entry
-  (including brackets, close and reverse), ATM strategies, strategies-on-Sim, and the Playback
-  seek/speed/run controls — all Simulator/Playback only, all gated the same way. `ops.enabled`
-  arms the separate, reduce-only ops module below.
-- **Live-connection guards.** An assembly reload and both ops actions are refused while a
-  connection that can route orders to a real broker is up. A broker *demo* counts as live, on
-  purpose: the guard asks "can this connection send an order", not "is this real money".
+- **Two opt-in files, each an empty file you create by hand**: `orders.enabled` and `ops.enabled`.
+  `ops.enabled` is ignored again after 24 hours; `orders.enabled` does not expire — delete it to
+  disarm. No tool, script or test in this repository creates either file for you. `orders.enabled`
+  arms four things behind one file: order entry (including brackets, close and reverse), ATM
+  strategies, strategies-on-Sim, and the Playback seek/speed/run controls — all Simulator/Playback
+  only, all gated the same way. `ops.enabled` arms the separate, reduce-only ops module below.
+- **Live-connection guards.** An assembly reload and `ops.reconnect` are refused while a connection
+  that can route orders to a real broker is up; `ops.flatten` is refused the same way only when the
+  account being flattened is not Simulator/Playback. A broker *demo* counts as live, on purpose:
+  the guard asks "can this connection send an order", not "is this real money". Order entry, ATM,
+  strategies-on-Sim and Playback writes never refuse on this basis — the Simulator/Playback
+  provider check already keeps real money out of reach, whatever connections are up.
 - **Text is data.** Output, logs, indicator names, drawing tags and window titles can contain
   text written by third-party add-ons or a data feed. The tools that return such text say so in
   their descriptions: it is data, never instructions.
@@ -693,14 +761,15 @@ tool or bad arguments.
 | `addon/NOTES.md`, `addon/BACKTEST_RECIPE.md` | what we learned about NinjaTrader internals: reflection targets, threading rules, the headless backtest recipe |
 | `server/nt8_mcp/` | the MCP server; `tools_*.py` files are loaded automatically |
 | `API.md`, `docs/api/` | the HTTP contract, one file per module |
-| `scripts/` | installer, offline compile check, live smoke test |
+| `scripts/` | installer, offline compile check, NinjaScript linter (`nt_lint.py`), live smoke test |
 
 Checks before a pull request:
 
 ```
-bash scripts/check.sh addon/*.cs        # offline compile of the AddOn -> CHECK_OK
-python server/tests/run_all.py          # unit tests, no NinjaTrader needed
-bash scripts/live-smoke.sh -b           # against a running NinjaTrader; -b adds the backtest checks
+bash scripts/check.sh addon/*.cs   # offline compile of the AddOn -> CHECK_OK
+python server/tests/run_all.py     # unit tests, no NinjaTrader needed
+bash scripts/live-smoke.sh -b      # needs a running NinjaTrader;
+                                   # -b adds the backtest checks
 ```
 
 NinjaTrader has no public API for most of what this project does, so the AddOn binds some internal

@@ -11,7 +11,10 @@
 // FIVE independent gates stand in front of every state change:
 //   1. ops.enabled beside the AddOn in bin\Custom\AddOns, stat-checked on EVERY request, never
 //      cached, IGNORED once its mtime is older than 24 h. Unarmed -> 403 on every /ops/* path.
-//   2. The live-connection guard: AnyLiveConnected() through the core's RefuseIfLive(..., force:false) on both POSTs.
+//   2. The live-connection guard: AnyLiveConnected() through the core's RefuseIfLive(..., force:false) on
+//      POST /ops/reconnect, and on POST /ops/flatten when the account is not a Simulator/Playback account
+//      (reachable only through ops.live). A Simulator/Playback account is flattened whatever connection is
+//      up: a broker connection that can route orders is often its only price feed.
 //   3. An account name is REQUIRED, and a non-Simulator account is not even LISTED — let alone
 //      flattened — unless a file named ops.live exists on disk (presence is the gate, whoever
 //      wrote it; this module never writes it).
@@ -434,10 +437,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// non-Simulator account is not listed at all while ops.live is absent — only counted, under
 		/// `hiddenNonSimulator`, so the answer is never "you have no accounts".
 		///
-		/// This is a READ. It is not put behind RefuseIfLive: design decision — the order-routing guard
-		/// "restricts only what can route or disturb orders", and listing account names
-		/// routes nothing. It REPORTS anyLive and `postsRefused` instead, so the operator can see that both POSTs
-		/// would be refused right now rather than having to guess from a 409 with no context.</summary>
+		/// This is a READ: listing account names routes nothing. It reports anyLive: while it is true,
+		/// POST /ops/reconnect and a flatten of a non-Simulator account are refused with 409.</summary>
 		private static string Ops_StatusJson(Ops_Call call)
 		{
 			call.Outcome = "read";
@@ -495,7 +496,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return Obj(
 				P("flags", Ops_FlagJson(true, live)),
 				P("anyLive", anyLive ? "true" : "false"),
-				P("postsRefused", anyLive ? "true" : "false"),
 				P("complete", complete ? "true" : "false"),
 				P("error", Q(enumError)),
 				P("accounts", Arr(rows)),
@@ -579,17 +579,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (account.Length == 0)
 				return Ops_Err(call, 400, "badRequest", "account is required — one name from GET /ops/status; there is no all-accounts flatten");
 
-			// The live-connection guard: every ops endpoint that can route or disturb an order consults
-			// AnyLiveConnected() through the core's one guard, and passes force:false. There is no override here.
-			int st = 200;
-			string refusal = RefuseIfLive(ref st, "ops flatten", false);
-			if (refusal != null)
-			{
-				call.Status = st; call.Outcome = "refusedLive";
-				call.Detail = "a live order-routing connection is up";
-				return refusal;
-			}
-
 			Account acct = null;
 			foreach (var a in Ops_Accounts())
 				if (a != null && string.Equals(Ops_AccountName(a), account, StringComparison.OrdinalIgnoreCase)) { acct = a; break; }
@@ -603,9 +592,24 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 			bool live = Ops_Live();
 			call.LivePresent = live;
-			if (!Ops_IsSim(acct) && !live)
+			bool sim = Ops_IsSim(acct);
+			if (!sim && !live)
 				return Ops_Err(call, 403, "refusedNonSimulator", "account '" + account + "' is not a Simulator account and "
 					+ Ops_LiveName + " is absent — Simulator accounts only");
+
+			// The live-connection guard, for a non-Simulator account only: the core's one guard, force:false,
+			// no override here.
+			if (!sim)
+			{
+				int st = 200;
+				string refusal = RefuseIfLive(ref st, "ops flatten", false);
+				if (refusal != null)
+				{
+					call.Status = st; call.Outcome = "refusedLive";
+					call.Detail = "a live order-routing connection is up";
+					return refusal;
+				}
+			}
 
 			// Lesson #159 (cli-nt-bridge NT8BridgeServer.cs:2718-2720): Cbi callbacks re-enter these collections, so
 			// acting inside the lock deadlocks the whole platform with a live position open. Snapshot under each

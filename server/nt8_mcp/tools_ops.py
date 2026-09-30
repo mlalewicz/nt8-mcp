@@ -40,8 +40,9 @@ def nt_flatten(account: str, instrument: str | None = None, confirm: str | None 
     It is disarmed by default: every /ops/* path answers 403 {"error":"ops module not armed"} unless
     a file named ops.enabled sits in bin\\Custom\\AddOns and was written inside the past 24 hours
     (stat-checked on every request, never cached). A non-Simulator account is not even LISTED as a
-    target unless a second file, ops.live, exists. Both POSTs are also refused with 409 while any
-    connection that can route orders is connected.
+    target unless a second file, ops.live, exists. A flatten of such a non-Simulator account is also
+    refused with 409 while any connection that can route orders is connected; a Simulator or
+    Playback account is flattened whatever connection is up.
 
     IT DOES NOT DISABLE THE STRATEGY. A still-enabled strategy sees itself flat on the next tick and
     can re-enter immediately — flattening is not stopping. NinjaTrader closes the position

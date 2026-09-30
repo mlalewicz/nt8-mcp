@@ -344,7 +344,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 				inputs.Add(P(p.Name, Scalar(v)));
 			}
 
-			var bars	= ind.Bars;
+			// BarsArray[0], not Bars: in a multi-series script Bars follows the series that updated last (e.g. a hidden
+			// 1-second series), so its count indexes past the primary-synced plot series and every value read null.
+			var bars	= ind.BarsArray != null && ind.BarsArray.Length > 0 && ind.BarsArray[0] != null ? ind.BarsArray[0] : ind.Bars;
 			int count	= bars.Count;
 			var plots	= new List<string>();
 			if (ind.Plots != null)
@@ -362,7 +364,18 @@ namespace NinjaTrader.NinjaScript.AddOns
 							values.Add(Obj(P("time", Tm(bars.GetTime(b))), P("value", v)));
 						}
 					}
-					plots.Add(Obj(P("name", Q(plotName)), P("values", Arr(values))));
+					// last = the newest valid point. An OnBarClose indicator has no value on the forming bar, so
+					// values[] ends in null there even though the plot is live one bar back.
+					string last = "null";
+					if (ind.Values != null && i < ind.Values.Length && ind.Values[i] != null)
+					{
+						var series = ind.Values[i];
+						for (int b = count - 1; b >= Math.Max(0, count - 500); b--)   // ponytail: 500-bar lookback, widen if a sparse plot needs it
+						{
+							try { if (series.IsValidDataPointAt(b)) { last = Obj(P("time", Tm(bars.GetTime(b))), P("value", D(series.GetValueAt(b)))); break; } } catch { break; }
+						}
+					}
+					plots.Add(Obj(P("name", Q(plotName)), P("values", Arr(values)), P("last", last)));
 				}
 
 			string display;

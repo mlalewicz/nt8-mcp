@@ -69,7 +69,7 @@ if (seg[0] == "atm" && seg[1] == "start" && method == "POST")
     return Ord_Guarded("/atm/start", "atm.start", body, ref status, Atm_Start);
 ```
 
-It does not repeat the flag test, the live-routing test, the provider test, the caps, the token or
+It does not repeat the flag test, the account and provider tests, the caps, the token or
 the audit log — and it **cannot weaken** any of them, because none of them takes a parameter that
 turns it off. `verb` is the readable prefix of every plan string that call can sign, so two verbs
 can never share a token.
@@ -86,11 +86,9 @@ Nine gates, in this order. Gate 1 answers before the body is parsed; **every ref
 onwards is audited**.
 
 **1. `orders.enabled`.** A file beside the AddOn in `bin\Custom\AddOns`. Stat-checked on **every
-request**, never cached, and **ignored once its mtime is older than 24 h** — a flag forgotten after
-one debugging session must not arm order entry for ever. The age is bounded on **both** sides: a
-future mtime (a clock that runs ahead, a restore from backup, a deliberate `LastWriteTime` stamp)
-is ignored too, because "age ≤ 24 h" is true of every negative age. Disarming is
-`del orders.enabled`: no recompile, no NT8 restart. While it is absent or stale, **every**
+request**, never cached. **Off by default**: no code creates it, so the user creates it by hand to
+opt in, and once created it stays **armed until the user deletes it**, whatever its age. Disarming is
+`del orders.enabled`: no recompile, no NT8 restart. While it is absent, **every**
 `/orders/*` path — `/orders/status` included — answers:
 
 ```
@@ -100,25 +98,24 @@ is ignored too, because "age ≤ 24 h" is true of every negative age. Disarming 
 and no new request does anything. **One thing outlives the arming file, on purpose:** the exits of a
 bracket whose entry was accepted while the module **was** armed. The watcher re-reads the flag before
 it sends them, but it still sends them — a filled entry with no stop is worse than a send from a
-disarmed module — and the audit line is named **`bracketDisarmed`** (or `bracketLiveConnection` when
-a live routing connection has come up meanwhile) instead of `bracketExits`, with `armed=false` in its
-detail. To leave nothing pending, cancel the resting entry before disarming; `pendingBrackets` in
-`/orders/status` is the count, and `Stop_Orders` writes a `bracketAbandoned` line per bracket that
-was still waiting at a recompile. **`ops.enabled` does not arm this module and `orders.enabled` does not arm ops**:
-they are different file names, and `Ops_Flag()` is never called from `NT8BridgeOrders.cs`. An
-unarmed call is **not** audited, because it never reached the account layer.
+disarmed module — and the audit line is named **`bracketDisarmed`** instead of `bracketExits`, with
+`armed=false` in its detail. To leave nothing pending, cancel the resting entry before disarming;
+`pendingBrackets` in `/orders/status` is the count, and `Stop_Orders` writes a `bracketAbandoned`
+line per bracket that was still waiting at a recompile. **`ops.enabled` does not arm this module and
+`orders.enabled` does not arm ops**: they are different file names, and `Ops_Flag()` is never called
+from `NT8BridgeOrders.cs`. An unarmed call is **not** audited, because it never reached the account
+layer.
 
-**2. `AnyLiveConnected()`.** Every POST goes through the core's one guard,
-`RefuseIfLive(…, force:false)`, and is refused with `409` while any Connected connection is neither
-Simulator nor Playback and can manage orders. There is no `force` on any endpoint. It runs **before
-the body is parsed** — it needs nothing from it. `GET /orders/status` is deliberately not behind
-this guard (listing account names routes nothing); it reports `anyLive` and `postsRefused` instead.
+**2. The account.** Required, matched by name (`OrdinalIgnoreCase`) to **exactly one** `Account` —
+two matches is a `409`, not a silent pick.
 
-**3. The account.** Required, matched by name (`OrdinalIgnoreCase`) to **exactly one** `Account` —
-two matches is a `409`, not a silent pick. Then `Provider.Simulator` or `Provider.Playback` only,
-read from `Account.Provider` first and the account's `Connection.Options.Provider` second; **a read
-that throws or returns null refuses**. The Backtest account is refused by name via
-`Account.BackTestAccountName`.
+**3. Its provider.** `Provider.Simulator` or `Provider.Playback` only, read from `Account.Provider`
+first and the account's `Connection.Options.Provider` second; **a read that throws or returns null
+refuses**. The Backtest account is refused by name via `Account.BackTestAccountName`, because it
+belongs to the Simulator connection and would otherwise pass. **This is the gate that keeps real
+money out of reach, the same way for every verb.** Which connections are up does not matter: a
+broker connection that can route orders is often a Simulator account's own price feed, and this
+gate already refuses every account that connection owns.
 
 **4. Validation.** The instrument resolves through `Instrument.GetInstrument`; `action` is one of
 `Buy`, `Sell`, `SellShort`, `BuyToCover`; `type` is one of `Market`, `Limit`, `StopMarket`,
@@ -264,9 +261,8 @@ that changed hands between the dry run and the confirm refuses the token.
 ## `GET /orders/status`
 
 ```json
-{ "flags": { "armed": true, "flagName": "orders.enabled", "flagAgeHours": 0.12,
-             "flagMaxAgeHours": 24 },
-  "anyLive": false, "postsRefused": false,
+{ "flags": { "armed": true, "flagName": "orders.enabled", "flagAgeHours": 0.12 },
+  "anyLive": false,
   "complete": true, "error": null,
   "accounts": [ { "name": "Sim101", "provider": "Simulator",
                   "openPositions": 1, "workingOrders": 2, "liveOrders": 2,
@@ -296,9 +292,11 @@ that changed hands between the dry run and the confirm refuses the token.
   "note": "…" }
 ```
 
-A non-Simulator account is **never listed** — only counted under `hiddenNonSimulator` — and there
-is no file that would make it appear. `orders[]` lists **every** live order of the account, whoever
-placed it: that is where the ids for `/orders/change` and `/orders/cancel` come from.
+`anyLive` reports whether a connection that can route orders is Connected — for information only;
+no path in this module refuses because of it. A non-Simulator account is **never listed** — only
+counted under `hiddenNonSimulator` — and there is no file that would make it appear. `orders[]`
+lists **every** live order of the account, whoever placed it: that is where the ids for
+`/orders/change` and `/orders/cancel` come from.
 `openPositions` / `workingOrders` / `liveOrders` / `positions` / `orders` are `null` with an `error`
 string when that account could not be read; they are never silently 0 or `[]`. `ordersTruncated` is
 `true` when an account holds more than 500 live orders. `liveOrders` ≥ `workingOrders`: the second
@@ -607,7 +605,7 @@ could not be re-read, which is **not** the same as flat.
 | `400` | bad JSON; missing/invalid `account`, `instrument`, `orderId`, `action`, `type`, `tif`, `quantity`; a price the type does not use; a bracket entry that is not `Buy`/`SellShort`; no stop loss or both forms of it; targets that do not add up; an unreadable tick size; `confirm` without `issuedAt`; nothing to change |
 | `403` | unarmed; non-Simulator account; the Backtest account; any cap, the position size of a `reverse` included |
 | `404` | no such account; no such live order on that account |
-| `409` | a live order-routing connection is up; the name matches more than one account; the order is no longer live; nothing to close; no position to reverse; a stale `issuedAt`; a confirm mismatch; a confirm that was **already used**; another change or cancel for that order is **in flight** |
+| `409` | the name matches more than one account; the order is no longer live; nothing to close; no position to reverse; a stale `issuedAt`; a confirm mismatch; a confirm that was **already used**; another change or cancel for that order is **in flight** |
 | `500` | the order, the position or the working-order count could not be read; the audit line could not be written (**nothing was sent**) |
 | `502` | `CreateOrder` / `Submit` / `Change` / `Cancel` / `Flatten` threw, or a close/reverse could not be verified |
 | `504` | the UI thread did not answer (this module makes no dispatcher call of its own) |
@@ -630,8 +628,8 @@ One JSON object per line in `Documents\NinjaTrader 8\nt8mcp\orders.jsonl`:
  "submitsInLastMinute":1}
 ```
 
-`outcome` is one of `read`, `readIncomplete`, `dryRun`, one of the refusal names (`refusedLive`,
-`refusedNonSimulator`, `backtestAccount`, `noSuchAccount`, `ambiguousAccount`, `noSuchOrder`,
+`outcome` is one of `read`, `readIncomplete`, `dryRun`, one of the refusal names
+(`refusedNonSimulator`, `backtestAccount`, `noSuchAccount`, `ambiguousAccount`, `noSuchOrder`,
 `notWorking`, `noPosition`, `nothingToDo`, `badRequest`, `noIssuedAt`, `staleToken`,
 `confirmMismatch`, `confirmReplayed`, `changeInFlight`, `capQuantity`, `capWorkingOrders`,
 `capRate`, `capUnreadable`, `orderUnreadable`, `positionUnreadable`, `auditFailed`), `intent`,
@@ -640,14 +638,13 @@ One JSON object per line in `Documents\NinjaTrader 8\nt8mcp\orders.jsonl`:
 `reverseUnverified` (the call did not throw but **no** state could be read — acceptance is not
 claimed), `rejected`, `submitFailed` / `changeFailed` / `cancelFailed` / `bracketFailed`,
 `bracketAccepted`, `bracketResting`, and the watcher's own lines — `bracketExits`,
-`bracketExitsPartial`, `bracketDisarmed`, `bracketLiveConnection`, `bracketNoFill`, `bracketCeiling`,
+`bracketExitsPartial`, `bracketDisarmed`, `bracketNoFill`, `bracketCeiling`,
 `bracketUnverified`, `bracketAbandoned` — plus `uiTimeout` and `error`.
 
-`bracketDisarmed` and `bracketLiveConnection` are `bracketExits` with the gate state that was true
-when the exits went out: the watcher re-reads the arming file and `AnyLiveConnected()` before every
-send and names the line after what it found, so "this module sent orders while it was disarmed" is
-one grep, not an inference. `bracketAbandoned` is written by the watcher at the 240-minute bound
-**and** by `Stop_Orders` — one line per bracket that was still waiting for its entry when the AddOn
+`bracketDisarmed` is `bracketExits` sent after the arming file was taken away: the watcher re-reads
+the arming file before every send and names the line after what it found, so "this module sent
+orders while it was disarmed" is one grep, not an inference. `bracketAbandoned` is written by the
+watcher at the 240-minute bound **and** by `Stop_Orders` — one line per bracket that was still waiting for its entry when the AddOn
 stopped, naming the account, the instrument and the plan, because a NinjaScript recompile is the
 routine deploy path and it leaves those entries live at the broker with no exits coming.
 
@@ -668,7 +665,7 @@ Three rows, published at `Start_Orders()` and refreshed on every request:
 
 | key | `resolved` | `detail` |
 |---|---|---|
-| `Orders.armed` | is `orders.enabled` present and fresh | `absent (orders.enabled)` / `armed, age 0.12 h of 24 h` / `STALE (ignored), age 31.40 h of 24 h` |
+| `Orders.armed` | is `orders.enabled` present | `absent (orders.enabled)` / `armed, age 0.12 h — delete orders.enabled to disarm` |
 | `Orders.endpoints` | = `Orders.armed` | the seven paths when armed, `none — module not armed; every /orders/* path answers 403` when not |
 | `Orders.caps` | always `true` | `CAPS qty=10/default working=20/default rate=60/default` |
 

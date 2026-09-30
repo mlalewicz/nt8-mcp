@@ -5,8 +5,8 @@ This closes the loop the rest of the server builds up to — write a strategy, c
 it, then run it live on a simulated account and read the fills back.
 
 A strategy places its OWN orders, so these tools sit behind exactly the same gate chain as
-nt_order_submit: the same arming file (orders.enabled), the same live-routing refusal, the same
-provider check, the same dry run and the same single-use confirm. There is no live switch.
+nt_order_submit: the same arming file (orders.enabled), the same provider check (Simulator/Playback
+accounts only), the same dry run and the same single-use confirm. There is no live switch.
 
 The strategy is added to NinjaTrader's own Control Center "Strategies" grid, so the user sees the
 row and can disable it by hand. Nothing here can start a strategy that would not appear there.
@@ -17,6 +17,8 @@ implementation.
 
 from nt8_mcp.app import _addon_get, _addon_post, mcp
 
+_SLOW_S = 60  # start/stop deadline: the AddOn polls the instance state before it answers
+
 _GATES = """
     SIMULATOR AND PLAYBACK ACCOUNTS ONLY — never a live account and never a broker demo, whatever
     the account is named. The AddOn judges this by the account's PROVIDER, not by its name, and it
@@ -24,8 +26,9 @@ _GATES = """
 
     TWO STEPS, always. Call it WITHOUT `confirm`: nothing is sent to NinjaTrader and you get back
     {dryRun:true, plan, confirm, issuedAt}. Read the plan — it names the account, the strategy, the
-    instrument, the bars period and EVERY input with the value the configured strategy really reads
-    back — then call it AGAIN with that exact confirm string and that exact issuedAt. The confirm
+    instrument, the bars period, Break at EOD, the trading hours and EVERY input with the value the
+    configured strategy really reads back — then call it AGAIN with that exact confirm string and
+    that exact issuedAt. The confirm
     string is the AddOn's, signed by it over the plan, the caps in force and that issuedAt: echo
     both back unchanged and never compute one yourself. issuedAt older than 30 seconds is refused,
     and a confirm issued for another verb (nt_order_submit's, nt_flatten's) is refused.
@@ -35,10 +38,10 @@ _GATES = """
 
     OFF BY DEFAULT. Every /strategy/{start,stop,running} path answers 403
     {"error":"orders module not armed"} unless a file named orders.enabled sits in
-    bin\\Custom\\AddOns and was written inside the past 24 hours. It is the SAME arming file the
-    order tools use: a strategy on a Simulator account places real simulated orders.
-    nt_strategy_start and nt_strategy_stop are also refused with 409 while any connection that can
-    route orders is connected.
+    bin\\Custom\\AddOns. It is the SAME arming file the order tools use: a strategy on a Simulator
+    account places real simulated orders. The user creates it to opt in, and it stays armed until
+    the user deletes it. A connection that can route orders may be up: it is often the only price
+    feed a Simulator account has, and the provider check keeps every live account out of reach.
 
     ON ANY REFUSAL YOU GET ONE SENTENCE, NOT A PLAN. Every non-2xx answer arrives here as
     {"error": "<the AddOn's sentence>"}. Do NOT retry blindly: run the dry run again and read the
@@ -67,6 +70,7 @@ def _body(**kw) -> dict:
 @_doc
 def nt_strategy_start(strategy: str, account: str, instrument: str, bars_period: dict,
                       inputs: dict | None = None, days_to_load: int | None = None,
+                      break_at_eod: bool | None = None, trading_hours: str | None = None,
                       confirm: str | None = None, issued_at: float | None = None) -> dict:
     """Add a strategy to NinjaTrader's Strategies grid on a Simulator or Playback account and enable
     it. From then on THE STRATEGY PLACES ITS OWN ORDERS on that account.
@@ -78,6 +82,14 @@ def nt_strategy_start(strategy: str, account: str, instrument: str, bars_period:
     inputs by name; an unknown name is a 400 that lists the real ones, and a fractional number for
     an integral input is a 400 rather than a silent rounding. `days_to_load` is optional and
     defaults to the strategy's own value.
+
+    `break_at_eod` is the Strategies dialog's "Break at EOD" and defaults to TRUE — the same default
+    nt_backtest uses without a chart, so the live bars sit on the grid the backtest used (without
+    it, 10/30/60-minute bars drift off the hour after an early close). `trading_hours` is a trading
+    hours template name, e.g. "CME US Index Futures ETH"; omit it to use the instrument's own. An
+    unknown name is a 400. The dry run reports both as the configured strategy reads them back
+    (`breakAtEodObserved`, `tradingHoursObserved`), and nt_strategy_runs reports what the live bars
+    were really built with.
 
     WHAT COMES BACK IS A MEASUREMENT. `ok` means the row is in the Strategies grid and the enable
     was dispatched — it NEVER means the strategy is trading. Read `state`: only "Realtime" is
@@ -102,13 +114,17 @@ def nt_strategy_start(strategy: str, account: str, instrument: str, bars_period:
     that refusal should never surface here.
 
     Keep the `id` that comes back: it is what nt_strategy_stop takes. A NinjaScript recompile
-    hot-reloads the AddOn and forgets every id while the strategies keep running — they stay in the
-    Control Center grid (nt_strategies_running lists it) and are disabled there by hand. A running
-    strategy is not re-adopted by id after such a reload; this is unhandled.
+    hot-reloads the AddOn while the strategies keep running. The first strategy call after it takes
+    back, under the SAME id, every run whose instance still runs on the same Simulator or Playback
+    account (`readopted: true` in nt_strategy_runs). Anything else stays in the Control Center grid
+    (nt_strategies_running lists it) and is disabled there by hand.
     """
-    return _addon_post("/strategy/start", _body(
+    # A start answers only after the enable has settled (up to three 8 s polls plus a Control Center hop),
+    # so the module-wide 5 s HTTP timeout would report a strategy that DID start as "not reachable".
+    return _addon_post("/strategy/start", _timeout=_SLOW_S, body=_body(
         strategy=strategy, account=account, instrument=instrument, barsPeriod=bars_period,
-        inputs=inputs, daysToLoad=days_to_load, confirm=confirm, issuedAt=issued_at))
+        inputs=inputs, daysToLoad=days_to_load, breakAtEod=break_at_eod, tradingHours=trading_hours,
+        confirm=confirm, issuedAt=issued_at))
 
 
 @mcp.tool(name="nt_strategy_stop")
@@ -145,21 +161,23 @@ def nt_strategy_stop(id: str, account: str, confirm: str | None = None,
     id, so a stop that acted on the original instance would read a strategy that never ran as
     already "Finalized".
     """
-    return _addon_post("/strategy/stop", _body(
+    return _addon_post("/strategy/stop", _timeout=_SLOW_S, body=_body(
         id=id, account=account, confirm=confirm, issuedAt=issued_at))
 
 
 @mcp.tool(name="nt_strategy_runs")
 def nt_strategy_runs() -> dict:
-    """The strategies THIS server started in this AddOn load, read back off the running instances:
-    state, position, working orders and realized PnL.
+    """The strategies THIS server started, read back off the running instances: state, position,
+    working orders, realized PnL and the number of real-time trades. Runs started before a
+    NinjaScript recompile come back with `readopted: true` while their instance still runs.
 
     Not the whole Control Center grid — that is nt_strategies_running, which is read-only and lists
     every row whoever created it. Use this one for the ids nt_strategy_stop takes.
 
-    It is a READ, so it needs only the arming file (orders.enabled, inside 24 hours) and is NOT
-    refused while a live connection is up; it reports `anyLive` instead so you can see that a start
-    or a stop would be refused right now.
+    It is a READ, so it needs only the arming file (orders.enabled). `anyLive` (a connection that
+    can route orders is up) is for information only. `barsBreakAtEod` and `barsTradingHours` are
+    what the live bars were built with: compare them with the settings of the backtest the run is
+    meant to match.
 
     `state` is the evidence, never a grid checkbox: only "Realtime" is trading, and null means the
     instance could not be read rather than "not running". `account` is the account each run was

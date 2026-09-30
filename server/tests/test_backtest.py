@@ -154,7 +154,8 @@ def test_nt_backtest_settings_are_sent_only_when_asked_for():
                         fill_resolution_type="Tick", fill_resolution_value=1,
                         commission_template="ES-RT", include_commission=True,
                         fill_limit_on_touch=True, include_trade_history=False,
-                        max_trades=50, tick_replay=False)
+                        max_trades=50, tick_replay=False, break_at_eod=False)
+    assert seen["breakAtEod"] is False
     assert seen["slippageTicks"] == 2.0
     assert seen["fillResolution"] == "High" and seen["fillResolutionType"] == "Tick"
     assert seen["fillResolutionValue"] == 1 and seen["maxTrades"] == 50
@@ -171,7 +172,7 @@ def test_nt_backtest_omits_unasked_settings():
         nt8.nt_backtest("SampleMACrossOver")
     for key in ("template", "fillResolution", "fillResolutionType", "fillResolutionValue",
                 "slippageTicks", "commissionTemplate", "includeCommission",
-                "fillLimitOnTouch", "includeTradeHistory", "maxTrades"):
+                "fillLimitOnTouch", "includeTradeHistory", "maxTrades", "breakAtEod"):
         assert key not in seen, key
 
 

@@ -75,7 +75,10 @@ def nt_output_window(n: int = 200):
 
 @mcp.tool(name="nt_account")
 def nt_account(name: str = ""):
-    """Read-only account state: cash, realized/unrealized P&L, positions, orders. No name = all accounts."""
+    """Read-only account state: cash, realized/unrealized P&L, positions, orders. No name = all accounts.
+    Each working order carries `owner` ("module", "atm", "manual", or "strategy <name> #<id> alive|dead")
+    plus `ownerStrategyId`, `ownerState` and `ownerAlive`: a dead owner means nobody manages that order
+    (nt_cancel_orphans cleans those up)."""
     return _addon_get("/account", name=name)
 
 

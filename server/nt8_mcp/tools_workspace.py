@@ -74,10 +74,14 @@ def nt_workspace() -> dict:
 def nt_strategies_running(materialize: bool = False) -> dict:
     """Read the Control Center's Strategies grid: the strategy population that is NOT on a chart and
     that nt_charts/nt_workspace therefore cannot see. Returns {gridResolved, strategies, notes};
-    `strategies` is a list of rows (name, parent, type, enabled, state, account, instrument, connected,
-    connection, dataSeries, position, accountPosition, averagePrice, realized, unrealized, trades,
-    parameters, workspace), with one row per master entry plus one per per-instrument child (its
-    `parent` names the master). `enabled` is grid state and is NOT proof a strategy is running —
+    `strategies` is a list of rows (name, parent, type, enabled, state, strategyId, liveState,
+    instanceAlive, startedByBridge, account, instrument, connected, connection, dataSeries, position,
+    accountPosition, averagePrice, realized, unrealized, trades, parameters, workspace), with one row
+    per master entry plus one per per-instrument child (its `parent` names the master).
+    `strategyId` is NinjaTrader's strategy Id (a string) — the handle nt_grid_remove and
+    nt_grid_enable take. NinjaTrader runs a clone sharing that Id, so `liveState` is the most alive
+    state over every instance with it and `instanceAlive` is true when one is in Configure..Realtime;
+    `startedByBridge` is true for a run nt_strategy_start made. `enabled` is grid state and is NOT proof a strategy is running —
     believe `state`. When the grid could not be read, gridResolved is false and `strategies` is null,
     never [] — "we could not read it" and "there are none" are different claims. The grid is read from
     the Control Center's visual tree when the Strategies tab is selected and from its logical tree when

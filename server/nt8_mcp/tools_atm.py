@@ -38,9 +38,10 @@ _GATES = """
 
     OFF BY DEFAULT. Every /atm/* path — the two reads included — answers 403
     {"error":"orders module not armed"} unless a file named orders.enabled sits in
-    bin\\Custom\\AddOns and was written inside the past 24 hours (stat-checked on every request,
-    never cached). ops.enabled does not arm this. Every write here is also refused with 409 while
-    any connection that can route orders is connected.
+    bin\\Custom\\AddOns (stat-checked on every request, never cached). The user creates it to opt
+    in, and it stays armed until the user deletes it. ops.enabled does not arm this. A connection
+    that can route orders may be up: the provider check, not the connection list, keeps every live
+    account out of reach.
 
     ON ANY REFUSAL YOU GET ONE SENTENCE, NOT A PLAN. Every non-2xx answer arrives here as
     {"error": "<the AddOn's sentence>"} — the status code and the rest of the body (including the

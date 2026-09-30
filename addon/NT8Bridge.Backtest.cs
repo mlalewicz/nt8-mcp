@@ -477,6 +477,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (rangeProblem != null) return Err(ref status, 400, tmpl == null ? rangeProblem : rangeProblem + " (from template '" + tmpl.File + "')");
 			job.From = from; job.To = to;
 			job.TickReplay = JGetBool(req, "tickReplay", false);
+			// Break at EOD (IsResetOnNewTradingDay): explicit breakAtEod wins; else the chart's own setting when seeded
+			// from a chart; else true, like a new chart or Strategy Analyzer series. With it off, time bars continue across
+			// sessions, so a 13:15 early close shifts 10/30/60-min bars onto a :05 / :15 grid for the rest of the run.
+			if (JGet(req, "breakAtEod") != null) job.ResetDay = JGetBool(req, "breakAtEod", true);
+			else if (chartId == null) job.ResetDay = true;
 
 			// ── run settings ──────────────────────────────────────────────
 			// Validated HERE, on the HTTP thread: an unknown name or an out-of-range number is a 400 before the
@@ -628,6 +633,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			pairs.Add(P("warnings", job.WarningsJson));		// added after the frozen keys (NOTES.md "Status document v1")
 			pairs.Add(P("equity", job.EquityJson));			// {time, cumulativeNetProfit} per closed trade, by exit time — always an array
 			pairs.Add(P("outputNote", job.OutputNoteJson));	// non-null only when `output` above is null instead of a captured (possibly empty) array
+			pairs.Add(P("breakAtEod", job.ResetDay ? "true" : "false"));	// added after the frozen keys: the Break-at-EOD the bars were built with
 			return Obj(pairs.ToArray());
 		}
 

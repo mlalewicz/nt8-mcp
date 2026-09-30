@@ -50,6 +50,7 @@ def nt_backtest(
     include_trade_history: bool | None = None,
     max_trades: int = 0,
     save_run: bool = True,
+    break_at_eod: bool | None = None,
 ):
     """Run a strategy backtest and wait for it to finish, returning the final status doc (summary + trades +
     settings). Runs on the Backtest account only — no Sim or live account is ever touched. Strategies that read
@@ -70,7 +71,10 @@ def nt_backtest(
     "ES ##-##") — NinjaTrader cannot backtest one, so name a dated contract such as "ES 12-26" (nt_data_coverage
     may still list a continuous name as "resolved"; that is a different question, what local data exists, not
     whether a backtest can use it). Anything unknown or out of range is refused before the job is armed.
-    The returned document echoes every effective setting under "settings" — read back off the strategy, not
+    break_at_eod (Break at EOD, IsResetOnNewTradingDay): omitted = the chart's setting with chart=, else true
+(what a new chart or Strategy Analyzer series uses); false lets time bars run across sessions, so after a
+13:15 early close 10/30/60-min bars sit on a :05/:15 grid. The status doc echoes it as "breakAtEod".
+The returned document echoes every effective setting under "settings" — read back off the strategy, not
     from this call, because several NinjaTrader setters silently no-op. A job whose strategy never really ran
     (no bars ever loaded) ends state "error" with a reason instead of a false "done" — check "error", not just
     "state == done" plus a trade count. ALWAYS read "barsFrom"/"barsTo" (the bars really loaded) and
@@ -120,6 +124,8 @@ def nt_backtest(
         body["includeCommission"] = include_commission
     if fill_limit_on_touch is not None:
         body["fillLimitOnTouch"] = fill_limit_on_touch
+    if break_at_eod is not None:
+        body["breakAtEod"] = break_at_eod
     if include_trade_history is not None:
         body["includeTradeHistory"] = include_trade_history
     if max_trades:

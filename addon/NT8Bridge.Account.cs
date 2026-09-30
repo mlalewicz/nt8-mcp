@@ -140,6 +140,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 					try
 					{
 						if (Array.IndexOf(WorkingStates, o.OrderState) < 0) continue;
+						var w = Desk_Owner(o);
 						orders.Add(Obj(
 							P("id", Q(o.OrderId)),
 							P("instrument", Q(Acct_Sv(() => o.Instrument.FullName))),
@@ -147,7 +148,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 							P("type", Q(o.OrderType.ToString())),
 							P("qty", D(o.Quantity)),
 							P("price", D(o.OrderType == OrderType.Limit || o.OrderType == OrderType.StopLimit ? o.LimitPrice : o.StopPrice)),
-							P("state", Q(o.OrderState.ToString()))));
+							P("state", Q(o.OrderState.ToString())),
+							// Who owns it: the strategy Id and whether that Id still has a live instance
+							// (NT8BridgeDesk.cs). A dead owner means nobody manages this order.
+							P("owner", Q(w.Label)),
+							Desk_OwnerPairs(w)));
 					}
 					catch (Exception ex) { orders.Add(Obj(P("error", Q(Deep(ex))))); }
 				}

@@ -8,10 +8,10 @@ This closes the loop the rest of the server builds up to: **write a strategy →
 backtest it → run it on a Simulator or Playback account → read the fills back**.
 
 **A strategy places its own orders.** That is the point of the verb, and it is why these endpoints
-sit behind exactly the same gate chain as `/orders/submit` — the same arming file, the same
-live-routing refusal, the same provider check, the same dry run, the same single-use confirm, the
-same audit log. **There is no live switch of any kind**: this file never reads `ops.live`, never
-creates a flag file, and has no code path that accepts a third provider.
+sit behind the same gate chain as `/orders/submit` — the same arming file, the same account and
+provider checks, the same dry run, the same single-use confirm, the same audit log. **There is no
+live switch of any kind**: this file never reads `ops.live`, never creates a flag file, and has no
+code path that accepts a third provider.
 
 **Nothing started here is hidden.** The strategy is added to NinjaTrader's own Control Center
 **Strategies** grid through that grid's own add / enable / disable path, so the user sees the row
@@ -51,22 +51,27 @@ Ord_Approve(gate, plan, planJson, detail, null)
 so gates 1, 2, 3, 6, 7 and 9 are the order module's, unchanged and not re-implemented here:
 
 1. **`orders.enabled`** beside the AddOn in `bin\Custom\AddOns`, stat-checked on every request,
-   ignored when older than 24 h. Unarmed → `403 {"error":"orders module not armed"}` on all three
-   paths, before the body is parsed. It is the **same** file the order tools use, on purpose: a
-   strategy on a Simulator account places real simulated orders.
-2. **`RefuseIfLive(..., force:false)`** on `start` and `stop` → `409` while any connection that can
-   route orders is Connected. No override. `GET /strategy/running` is a read and reports `anyLive`
-   instead of refusing.
-3. **The account**: required, matched by name to **exactly one** `Account`, `Provider.Simulator` or
-   `Provider.Playback` only, and the Backtest account refused by name.
+   never cached. Off by default, and once created it stays armed until it is deleted, whatever its
+   age. Unarmed → `403 {"error":"orders module not armed"}` on all three paths, before the body is
+   parsed. It is the **same** file the order tools use, on purpose: a strategy on a Simulator
+   account places real simulated orders.
+2. **The account**: required, matched by name to **exactly one** `Account`.
+3. **Its provider**: `Provider.Simulator` or `Provider.Playback` only, and the Backtest account
+   refused by name. This is the gate that keeps real money out of reach, the same way for every
+   verb — `start` and `stop` included. Which connections are up does not matter: a broker
+   connection that can route orders is often a Simulator account's own price feed, and this gate
+   already refuses every account that connection owns. The running instance's account is still
+   read back after the start regardless (see below).
 4. **This module's own availability**: `StrategiesGrid.StrategyAdd`, `StrategyEnable` and
    `StrategyDisable` must all have resolved at `Start_StrategyRun`. Any one missing → `501` on
    `start` **and** on `stop`, and nothing is started. `GET /compat` carries the row
    `StrategyRun.canStart`.
 5. **Validation**: the strategy type exists in this AddOn's assembly and resolves to exactly one;
-   the instrument resolves; `barsPeriod` is present and sane; `daysToLoad` is 1…3650; every
-   `inputs` key is a real `[NinjaScriptProperty]` input and its value coerces (a fractional number
-   for an integral input is a `400`, never a silent rounding). NinjaTrader's own
+   the instrument resolves; `barsPeriod` is present and sane; `daysToLoad` is 1…3650; `breakAtEod`,
+   when present, must be a boolean; `tradingHours`, when present, must name a template NinjaTrader
+   has, or `400 "no trading hours template named '…'"`; every `inputs` key is a real
+   `[NinjaScriptProperty]` input and its value coerces (a fractional number for an integral input
+   is a `400`, never a silent rounding). NinjaTrader's own
    `StrategiesGrid.IsStrategyConfigurationValid` runs on the configured instance at **dry-run**
    time, so a configuration it rejects is refused before any token is issued.
 6. **No `confirm` = dry run.** Nothing is sent, nothing is added to the grid.
@@ -169,12 +174,18 @@ of that account and says nothing about what the strategy left on the other one.
 | `barsPeriod` | yes | `{type, value, value2?, baseType?, baseValue?}`. `type` is a `BarsPeriodType` name or, for a custom bar type with no enum name, its number. `MarketDataType` is always `Last` |
 | `inputs` | no | `[NinjaScriptProperty]` inputs by name; an unknown name is a `400` that lists the real ones |
 | `daysToLoad` | no | 1…3650; absent keeps the strategy's own value |
+| `breakAtEod` | no | boolean, default `true` — `StrategyBase.IsStableSession`, the Strategies dialog's "Break at EOD". Same default `/backtest` uses without a chart, so a live run builds the bars its backtest did; without it, 10/30/60-minute bars drift off the hour after an early close. A non-boolean value is a `400` |
+| `tradingHours` | no | a trading hours template name, e.g. `"CME US Index Futures ETH"`; absent uses the instrument's own. An unknown name is `400 "no trading hours template named '…'"` |
 | `confirm` / `issuedAt` | no | absent = dry run |
 
 Dry run → `{dryRun:true, plan, confirm, issuedAt, expiresInSec, caps, flags, note}`. The `plan`
-carries the account, the strategy, the instrument, the bars period, `daysToLoad` and **every**
-input with the value the configured instance really reads back — not only the keys that were sent —
-because the plan is built off a real instance that is then torn down.
+carries the account, the strategy, the instrument, the bars period, `daysToLoad`, `breakAtEod`,
+`tradingHours` and **every** input with the value the configured instance really reads back — not
+only the keys that were sent — because the plan is built off a real instance that is then torn
+down. `breakAtEodObserved` and `tradingHoursObserved` carry what that same configured instance
+reads back for the two settings (`breakAtEodObserved` is `null` when it could not be read). The
+signed plan string carries `BREAKATEOD=` and `TRADINGHOURS=` right after `DAYSTOLOAD=` and before
+`INPUTS=`.
 
 Confirmed →
 
@@ -182,6 +193,7 @@ Confirmed →
 {"ok":true,"dryRun":false,"id":"s1","account":"Sim101","accountObserved":"Sim101",
  "strategy":"SampleMACrossOver",
  "instrument":"ES 12-26","barsPeriod":{"type":"Minute","value":5,"...":"..."},"daysToLoad":5,
+ "breakAtEod":true,"tradingHours":null,
  "inputs":{"Fast":10,"Slow":25},"state":"Realtime","running":true,"inStrategiesGrid":true,
  "startedAt":"2026-09-19T21:14:07","plan":{...},"caps":{...},"auditLog":"...","note":"..."}
 ```
@@ -240,7 +252,8 @@ A read: gate 1 (armed) only. It reports `anyLive` and `canStart` instead of refu
 operator can see that a start would be refused right now.
 
 Each row: `id`, `strategy`, `account`, `accountObserved`, `accountMatches`, `accountError`,
-`instrument`, `barsPeriod`, `inputs`, `startedAt`,
+`instrument`, `barsPeriod`, `breakAtEod`, `tradingHours`, `barsBreakAtEod`, `barsTradingHours`,
+`readopted`, `inputs`, `startedAt`,
 `stoppedAt`, `state`, `running`, `inStrategiesGrid`, `position` + `positionError`, `workingOrders`
 (each with its `owner`: `module` / `strategy <name>` / `atm` / `manual`) + `workingOrdersError`,
 `realizedPnL`, `realtimeTrades`, `performanceError`, `stopNote`.
@@ -252,19 +265,27 @@ Each row: `id`, `strategy`, `account`, `accountObserved`, `accountMatches`, `acc
   reach later, which is why this is a live read and not a cached field.
 - `position` and `workingOrders` are the **account's**, for that instrument — an order placed by
   hand on the same instrument is listed too, with its own `owner`.
+- `breakAtEod` and `tradingHours` are what the run **asked for**; `barsBreakAtEod`
+  (`IsResetOnNewTradingDay`) and `barsTradingHours` are what the live bars were **actually built
+  with**, read off the instance's own `BarsArray[0]` — `barsBreakAtEod` is `null` when the bars
+  cannot be read yet. Compare the two pairs against the backtest this run is meant to match.
+- `readopted` is `true` for a run this module took back, under its original `id`, after a
+  NinjaScript recompile (see Known limits, below).
 - `realizedPnL` / `realtimeTrades` come off the instance's own
-  `SystemPerformance.RealTimeTrades.TradesPerformance.Currency.CumProfit`; both are `null`, with
-  `performanceError` set, until the strategy has one.
+  `SystemPerformance.RealTimeTrades.TradesPerformance.Currency.CumProfit` and `.TradesCount` — the
+  trade **count**, not the in-memory trade collection's own size, which reads `0` for a live run
+  that keeps no `Trade` objects while the count and the P&L still add up every trade. Both are
+  `null`, with `performanceError` set, until the strategy has one.
 
 ## Status codes
 
 | Code | When |
 |---|---|
 | 200 | dry run; a start whose row is in the grid; a stop whose instance reported `Terminated` |
-| 400 | unknown strategy, unknown instrument, missing or malformed `barsPeriod`, `daysToLoad` out of range, unknown input name, a value that will not coerce, a configuration NinjaTrader rejects |
+| 400 | unknown strategy, unknown instrument, missing or malformed `barsPeriod`, `daysToLoad` out of range, `breakAtEod` not a boolean, an unknown `tradingHours` template name, unknown input name, a value that will not coerce, a configuration NinjaTrader rejects |
 | 403 | unarmed; a non-Simulator account; the Backtest account |
 | 404 | `no strategy run '<id>'` |
-| 409 | a live order-routing connection is up; ambiguous account or strategy name; stale, mismatched, already-used or wrong-verb confirm; the id belongs to another account; the run was already stopped; another stop for that id is in flight (`stopInFlight`) |
+| 409 | ambiguous account or strategy name; stale, mismatched, already-used or wrong-verb confirm; the id belongs to another account; the run was already stopped; another stop for that id is in flight (`stopInFlight`) |
 | 500 | the add or the dispatch failed; the audit line could not be written |
 | 501 | this NinjaTrader build does not expose the Control Center's add / enable / disable path |
 | 502 | the act ran but could not be verified (`state` unreadable or terminated on a start; not terminated on a stop); the instance's own account did not read back as the gated one (`accountMoved`) |
@@ -273,12 +294,19 @@ Each row: `id`, `strategy`, `account`, `accountObserved`, `accountMatches`, `acc
 
 ## Known limits
 
-- **A NinjaScript recompile empties the registry.** A `.cs` landing in `bin\Custom` hot-reloads this
-  AddOn (the normal deploy path, `addon/NOTES.md` lesson 8) and the `Sr_Run` list is a static in
-  `NinjaTrader.Custom`. The strategies **keep running** and keep their rows in the Control Center
-  grid, where `GET /strategies/running` lists them and the user disables them by hand — but their
-  ids are gone and `POST /strategy/stop` can no longer reach them. This is why the grid row is the
-  feature and not a nicety.
+- **A NinjaScript recompile no longer drops a run from the registry.** A `.cs` landing in
+  `bin\Custom` hot-reloads this AddOn (the normal deploy path, `addon/NOTES.md` lesson 8) with an
+  empty `Sr_Run` list while the strategies **keep running**. Every start and stop writes the active
+  runs to `strategy_runs.json` in the `nt8mcp` folder under NinjaTrader's user data directory, and
+  the first `/strategy` call after the reload takes each one back **under its original `id`** —
+  when an instance with that run's strategy id is still in `StrategyBase.All`, not `Finalized`, and
+  still carries a Simulator or Playback account of the same name. The provider check runs again on
+  the readopted instance; the file itself is never trusted. A run that does not clear that bar is
+  dropped from the file and logged; it keeps its row in the Control Center grid, where
+  `GET /strategies/running` lists it and the user disables it by hand. `readopted` on a
+  `GET /strategy/running` row says which case it was. **A resting bracket exit in the order module
+  is not carried the same way** — see `docs/api/orders.md`, gate 1: it is still abandoned at a
+  recompile, with a `bracketAbandoned` audit line.
 - **`Stop()` does not disable anything.** `Stop()` runs on every recompile; turning a user's running
   strategy off each time would be far worse than leaving it running.
 - **The plan must be reproducible.** It is rebuilt from a fresh instance on the confirm, so a
@@ -294,7 +322,7 @@ The order module's `<UserDataDir>\nt8mcp\orders.jsonl`, same shape, same lock �
 call, refusals included, with the caps that were in force. Outcomes from this module:
 `strategyRunning`, `strategyStarting`, `strategyUnverified`, `strategyStopped`,
 `strategyStopUnverified`, `accountMoved`, `stopInFlight`, plus the shared `dryRun`, `intent`,
-`refusedLive`, `badRequest`, `notAvailable`, `noSuchRun`, `accountMismatch`, `alreadyStopped`,
+`badRequest`, `notAvailable`, `noSuchRun`, `accountMismatch`, `alreadyStopped`,
 `error`.
 
 A `strategyRunning` or `strategyStarting` line carries `accountObserved` beside the requested

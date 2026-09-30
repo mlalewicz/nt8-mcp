@@ -514,7 +514,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (!Ord_Flag(out ageH))
 			{
 				outcome = "notArmed";
-				return "the module is not armed — " + Ord_FlagName + " is absent, stale or future-dated";
+				return "the module is not armed — " + Ord_FlagName + " is absent";
 			}
 			return Playback_PreflightProblem(out outcome);
 		}

@@ -8,7 +8,7 @@
 //   Ord_Approve(gate, plan, planJson, detail, limits)    dry run -> signed one-shot confirm -> intent
 //   Ord_Ok / Ord_Err                                     the result line, after the act
 //
-// so the arming file (orders.enabled), the live-order-routing refusal, the provider test
+// so the arming file (orders.enabled), the account and provider tests
 // (Provider.Simulator / Provider.Playback only, Backtest account refused), the caps, the token and
 // the audit log are the SAME ones order entry uses, and this file cannot weaken any of them: none
 // of them takes a parameter that turns it off. There is no live switch here either — no ops.live,
@@ -510,7 +510,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 			return Obj(
 				P("anyLive", anyLive ? "true" : "false"),
-				P("postsRefused", anyLive ? "true" : "false"),
 				P("account", Q(string.IsNullOrEmpty(filter) ? null : filter)),
 				P("atms", Arr(rows)),
 				P("finished", I(finished)),

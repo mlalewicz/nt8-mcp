@@ -49,7 +49,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 {
 	public partial class NT8Bridge : AddOnBase
 	{
-		public const string Version = "1.4.0";
+		public const string Version = "1.5.0";
 		private const int Port = 7891;
 		private static readonly TimeSpan UiTimeout = TimeSpan.FromSeconds(5);
 		private const int RebindTries = 5;													// bounded, off the UI thread
@@ -537,8 +537,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return o == null || (o.Provider != Provider.Simulator && o.Provider != Provider.Playback && o.CanManageOrders);
 		}
 
-		/// <summary>Real money at risk right now. Gates /compile?reload=1, /data/download and every ops endpoint.
-		/// If the connections cannot be read the answer is TRUE: not knowing is not a licence.</summary>
+		/// <summary>Real money at risk right now. Gates /compile?reload=1, /ops/reconnect and a flatten of a
+		/// non-Simulator account. If the connections cannot be read the answer is TRUE: not knowing is not a licence.</summary>
 		private static bool AnyLiveConnected()
 		{
 			try { return ConnSnapshot().Any(c => IsConnected(c) && IsLive(c)); }
@@ -553,8 +553,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		}
 
 		/// <summary>The one guard for every live-order-routing-sensitive endpoint. null = go ahead; otherwise the complete 409
-		/// body, status already set. `force` exists for /compile?reload=1 only; /data/download and
-		/// every ops endpoint pass false.</summary>
+		/// body, status already set. `force` exists for /compile?reload=1 only; the ops module passes false.</summary>
 		private static string RefuseIfLive(ref int status, string what, bool force)
 		{
 			if (!AnyLiveConnected()) return null;

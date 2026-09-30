@@ -87,7 +87,7 @@ accepts `first` (the first chart found).
 ### `GET /health`
 
 ```json
-{ "ok": true, "addonVersion": "1.4.0", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
+{ "ok": true, "addonVersion": "1.5.0", "nt8Version": "8.1.8.2", "startedAt": "2026-09-18T09:00:00",
   "connections": [{"name":"Sim101 feed","status":"Connected","provider":"Simulator","canManageOrders":false}],
   "charts": 1, "anyLive": false, "anyNonSim": true, "standingModal": null,
   "pid": 12345, "processStartUtc": "2026-09-18T08:59:50Z",
@@ -755,6 +755,20 @@ matplotlib is optional — without it `pdf` is `null` and `note` says why; never
 > **Design note:** `nt_report(id, status_doc, pdf_path)` also takes any status-document-shaped
 > object with no AddOn round trip, which is how a walk-forward's stitched result gets a PDF.
 
+`nt_match` (`server/nt8_mcp/tools_match.py` + `match.py`, no AddOn endpoint of its own) matches a
+backtest's trades (a file, a status doc, a backtest id, a saved run, or a new `nt_backtest` run) to a
+research reference CSV, per entry: date + side, then entry price, exit type and exit price within a
+tick tolerance. Scale-out rows are grouped, exit mismatches are checked for a same-bar
+stop-and-target on 1-minute bars, and news minutes are flagged. Full contract: `docs/api/match.md`.
+
+---
+
+## Lint (Python only, no AddOn file)
+
+**Adds no HTTP endpoint.** `nt_lint(paths, rules=None)` (and `scripts/nt_lint.py`) is a static,
+read-only scan of NinjaScript `.cs` files for known hazards: rules NT01-NT09 (plus
+NT04N), each with an id, a severity and a one-line fix hint. Full rule table: `docs/api/lint.md`.
+
 ---
 
 ## Ops (opt-in, disarmed by default, Batch 3)
@@ -785,10 +799,12 @@ routing on a connection a human deliberately parked).
    request, never cached, **ignored once older than 24 h** (bounded on both sides — a
    future-dated mtime is ignored too). Absent/stale: **every** `/ops/*` path, including
    `/ops/status`, answers `403 {"error":"ops module not armed"}` and nothing is audited.
-2. **`AnyLiveConnected()`** — both POSTs refuse with `409` while any Connected connection
-   is neither Simulator nor Playback and can manage orders. There is no `force` on either
-   endpoint. `GET /ops/status` is deliberately **not** behind this guard (listing account names
-   routes nothing) — it reports `anyLive`/`postsRefused` instead.
+2. **`AnyLiveConnected()`** — `/ops/reconnect` refuses with `409` while any Connected connection
+   is neither Simulator nor Playback and can manage orders. `/ops/flatten` refuses the same way
+   only when the account is not Simulator/Playback (reachable at all, then, only through
+   `ops.live`); its account checks run first. There is no `force` on either endpoint.
+   `GET /ops/status` is deliberately **not** behind this guard (listing account names routes
+   nothing) — it reports `anyLive` only.
 3. **`ops.live`** — a second file, same folder. Its **presence**, no age rule, is what makes a
    non-Simulator account (or connection) a valid target; without it such an account is not even
    listed by `/ops/status` (counted under `hiddenNonSimulator`) and flattening it is a `403`.
@@ -815,7 +831,7 @@ audited — it never reached the account layer.
 ```json
 { "flags": { "armed": true, "flagName": "ops.enabled", "flagAgeHours": 0.12,
              "flagMaxAgeHours": 24, "live": false, "liveName": "ops.live", "liveAgeHours": null },
-  "anyLive": false, "postsRefused": false, "complete": true, "error": null,
+  "anyLive": false, "complete": true, "error": null,
   "accounts": [ { "name": "Sim101", "provider": "Simulator", "simulator": true,
                   "openPositions": 1, "workingOrders": 2, "error": null } ],
   "hiddenNonSimulator": 2, "backtestAccounts": 1, "confirmWindowSec": 30,
@@ -922,13 +938,15 @@ plan names the order's `owner` (`module` / `strategy <name>` / `atm` / `manual`)
 its state and its filled quantity before you confirm.
 
 **The gate chain, in this order.** (1) The arming file `orders.enabled` beside the AddOn,
-stat-checked on every request, ignored when older than 24 h or future-dated; unarmed = `403
-{"error":"orders module not armed"}` on all seven paths, before the body is parsed. `ops.enabled`
-does not arm this module. (2) Every POST is refused while `AnyLiveConnected()` is true; there
-is no `force`. (3) The account must resolve to exactly one account whose provider is
-`Provider.Simulator` or `Provider.Playback`; a provider that cannot be read is a refusal; the
-Backtest account is refused by name. **There is no live switch: the module never reads `ops.live`
-and has no code path that accepts another provider.** (4) Validation. (5) Caps: 10 contracts per
+stat-checked on every request, never cached — off by default and, once created, armed **until
+deleted**, whatever its age; unarmed = `403 {"error":"orders module not armed"}` on all seven
+paths, before the body is parsed. `ops.enabled` does not arm this module. (2) The account must
+resolve to exactly one `Account` by name. (3) Its provider must be `Provider.Simulator` or
+`Provider.Playback`; a provider that cannot be read is a refusal; the Backtest account is refused
+by name — this is the gate that keeps real money out of reach, whatever connections are up: a
+broker connection that can route orders is often a Simulator account's own price feed, and this
+gate already refuses every account it owns. **There is no live switch: the module never reads
+`ops.live` and has no code path that accepts another provider.** (4) Validation. (5) Caps: 10 contracts per
 order, 20 working orders per account, 60 confirmed submits per minute; the optional file
 `nt8mcp\orders.config.json` changes them up to the code ceilings 100 / 100 / 600, and a value
 outside `1..ceiling` falls back to the default with a warning. A bracket's exits are exempt from
@@ -952,7 +970,7 @@ is never called anywhere in this repository. Full contract, every field and stat
 An ATM strategy is NinjaTrader's own bracket manager: a saved template holds a quantity, a stop
 loss and a profit target, and `/atm/start` sends one entry order under it — NinjaTrader then arms
 and manages that template's stop and target itself, on the fill. Every write goes through the
-**same** gate chain as `/orders/*` (`orders.enabled`, the live-routing refusal, the provider test,
+**same** gate chain as `/orders/*` (`orders.enabled`, the account and provider tests,
 the caps, the signed one-shot confirm, the same audit log). Full contract, including the
 NinjaTrader internals this depends on and what is still unconfirmed: `docs/api/atm.md`.
 
@@ -975,8 +993,12 @@ with `Account.Submit` after `AtmStrategy.StartAtmStrategy` has attached the temp
 
 Closes the loop: write a strategy, compile it, backtest it, then run it for real on a Simulator or
 Playback account and read the fills back. A strategy places its own orders, so this sits behind
-the **same** gate chain as `/orders/submit`. Full contract, including the NinjaTrader internals
-this depends on: `docs/api/strategyrun.md`.
+the **same** gate chain as `/orders/submit`. `POST /strategy/start` also takes `breakAtEod`
+(boolean, default `true`) and `tradingHours` (a template name) — the Strategies dialog's own
+"Break at EOD" and trading-hours settings, read back as `breakAtEodObserved` /
+`tradingHoursObserved` in the plan and as `barsBreakAtEod` / `barsTradingHours` (what the live bars
+were actually built with) on every `GET /strategy/running` row. Full contract, including the
+NinjaTrader internals this depends on: `docs/api/strategyrun.md`.
 
 | Method | Path | Returns |
 |---|---|---|
@@ -986,8 +1008,47 @@ this depends on: `docs/api/strategyrun.md`.
 
 **MCP: three tools**, `nt_strategy_start`, `nt_strategy_stop`, `nt_strategy_runs`. The strategy is
 added to NinjaTrader's own Control Center Strategies grid, enabled, so the user sees the row and
-can disable it by hand; after a NinjaScript reload the module no longer knows the ids of the
-instances it started, but the grid rows survive and the user disables them there.
+can disable it by hand. A NinjaScript reload starts this module with an empty registry, but the
+first `/strategy` call after it takes each run back under its original id — from a file written on
+every start and stop — as long as an instance with that run's strategy id is still running on the
+same Simulator or Playback account; otherwise the grid row survives and the user disables it there.
+
+---
+
+## Sim desk (opt-in, disarmed by default, Simulator only; `addon/NT8BridgeDesk.cs`)
+
+Repair verbs for a Strategies grid after a crash. Every write goes through the order module's door
+(`Ord_Guarded` / `Ord_Approve`): `orders.enabled`, one Simulator/Playback account (a live account is
+refused, no switch), dry run, signed one-shot confirm, intent + audit lines in `orders.jsonl`.
+"Alive" is judged by strategy **Id** over every instance in `StrategyBase.All` (NinjaTrader runs a
+clone sharing the Id): alive = some instance in Configure, Active, DataLoaded, Historical,
+Transition or Realtime. Full contract: `docs/api/desk.md`.
+
+| Method | Path | Body / query | Does |
+|---|---|---|---|
+| GET | `/desk/orphans` | `?account=&instrument=` (both optional) | per Sim account: `orphans` (live orders whose owner Id is dead) and `ownerUnknown` (automated, owner not found) |
+| POST | `/desk/cancelOrphans` | `{account, instrument?, confirm?, issuedAt?}` | cancel every orphan in one `Account.Cancel`; `ownerUnknown` orders are never cancelled |
+| POST | `/desk/gridRemove` | `{account, strategyId, confirm?, issuedAt?}` | `StrategiesGrid.StrategyRemove` on a row that is disabled, dead, on `account`, and not started by this AddOn |
+| POST | `/desk/gridEnable` | `{account, strategyId, confirm?, issuedAt?}` | `StrategiesGrid.StrategyEnable` on an existing row, only when it is in `desk_legs.json` and no other row/instance of the same (strategy, account) is enabled or alive |
+
+`strategyId` is sent as a string (a long does not survive a double). Refusals: `noAllowlist` /
+`notAllowlisted` (403), `alreadyEnabled` / `rowEnabled` / `duplicate` / `bridgeRun` /
+`accountMismatch` / `nothingToDo` (409), `noSuchRow` (404), `gridUnreadable` (503).
+
+Also new on existing endpoints: `GET /strategies/running` rows carry `strategyId`, `liveState`,
+`instanceAlive`, `startedByBridge`. `GET /account` order rows, `GET /orders/status` order rows and
+the `/orders/cancel` plan carry `owner` ("strategy <name> #<id> alive|dead" for a strategy),
+`ownerStrategyId`, `ownerState`, `ownerAlive`.
+
+**MCP (Python side)**: `nt_cancel_orphans`, `nt_grid_remove`, `nt_grid_enable` and
+`nt_desk_recover` also require the local lock file (`nt_lock`); `nt_desk_status`, `nt_crash_report`
+and `nt_leg_decisions` are read-only (the crash report reads the NinjaTrader log/trace folders and
+the Windows event log, no AddOn; `nt_leg_decisions` reads the per-leg files
+`nt8mcp\decisions\<strategy>_<account>.csv`, `NT8MCP_DECISIONS_DIR` overrides the folder).
+`nt_desk_recover` has no AddOn path of its own: it re-enables every allowlisted leg that is off
+through `/desk/gridEnable`, one AddOn dry run + confirm per row, under one MCP-signed one-shot
+confirm; a leg with 0 or more than 1 disabled, dead row is refused. `desk_legs.json` legs may carry
+an optional `"decision_time": "HH:MM"` (ET) for the silent-leg flag.
 
 ---
 

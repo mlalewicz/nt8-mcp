@@ -53,8 +53,8 @@ class Orders:
     """The documented /orders/* behaviour, as a scriptable fake.
 
     armed=False      -> 403 on every /orders/* path, whatever else is true, body parsed or not
-    flag_age_h > 24  -> the SAME 403: a stale flag is not a flag
-    any_live=True    -> 409 on every POST; /orders/status still answers
+    flag_age_h       -> any age arms it: the flag stays armed until it is deleted
+    any_live=True    -> refuses nothing: a connection that can route orders may be up; status reports it
     sim=False        -> 403. There is no second file that widens this, unlike the ops module.
     live_orders      -> {orderId: owner}. ANY of them can be changed or cancelled, not only the
                         ones the module placed: the plan names the owner instead of hiding the rest.
@@ -114,7 +114,7 @@ class Orders:
 
         # Gate 1 comes FIRST, before the body is parsed: an unarmed call never reaches the account
         # layer, so it is not audited and it leaks nothing but the one sentence.
-        if not self.armed or self.flag_age_h > 24:
+        if not self.armed:
             return 403, {"error": UNARMED}
         if verb == "status":
             return 200, self._status()
@@ -122,9 +122,6 @@ class Orders:
         body = json.loads(req.body) if req.body else {}
         self.posts.append(body)
 
-        if self.any_live:
-            return 409, {"error": "orders %s refused: a live order-routing connection is up "
-                                  "(see /health.connections)" % verb, "anyLive": True}
         if not (body.get("account") or "").strip():
             return 400, {"error": "account is required — one name from GET /orders/status; "
                                   "there is no all-accounts form"}
@@ -345,8 +342,8 @@ class Orders:
 
     def _status(self):
         return {"flags": {"armed": True, "flagName": "orders.enabled",
-                          "flagAgeHours": self.flag_age_h, "flagMaxAgeHours": 24},
-                "anyLive": self.any_live, "postsRefused": self.any_live,
+                          "flagAgeHours": self.flag_age_h},
+                "anyLive": self.any_live,
                 "accounts": [{"name": "Sim101", "provider": "Simulator",
                               "openPositions": 1 if self.position else 0,
                               "workingOrders": len(self.live_orders),
@@ -403,12 +400,11 @@ def test_unarmed_is_403_on_every_route_and_nothing_is_acted_on():
     assert orders.acted == 0, "an unarmed module must not act"
 
 
-def test_a_flag_older_than_24h_is_the_same_403_as_no_flag():
-    # A flag forgotten after one debugging session must not arm order entry for ever. A stale flag
-    # is indistinguishable from an absent one, deliberately.
-    orders = Orders(flag_age_h=25.0)
+def test_an_old_flag_still_arms_the_module():
+    # The flag has no age limit: the user's opt-in lasts until the user deletes the file.
+    orders = Orders(flag_age_h=500.0)
     result = _run(orders, nt8.nt_order_submit, **SUBMIT)
-    assert result == {"error": UNARMED}, result
+    assert "confirm" in result and "error" not in result, result
     assert orders.acted == 0
 
 
@@ -441,13 +437,16 @@ def test_a_non_simulator_account_is_refused_on_every_new_verb_too():
         assert orders.acted == 0
 
 
-def test_a_live_connection_refuses_every_post():
+def test_a_live_connection_refuses_nothing_on_a_simulator_account():
+    # A broker connection is often the only price feed a Simulator account has. The provider gate,
+    # not the connection list, keeps live accounts out (see the two tests above).
     orders = Orders(any_live=True)
     with FakeAddon() as fake:
         _wire(fake, orders)
         results = _every_tool(orders)
     for result in results:
-        assert "live order-routing connection" in result.get("error", ""), result
+        assert "live order-routing connection" not in result.get("error", ""), result
+    assert _run(Orders(any_live=True), nt8.nt_order_submit, **SUBMIT).get("confirm"), "a dry run still plans"
     assert orders.acted == 0
 
 

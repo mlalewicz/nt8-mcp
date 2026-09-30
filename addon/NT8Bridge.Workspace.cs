@@ -177,11 +177,14 @@ namespace NinjaTrader.NinjaScript.AddOns
 			else
 			{
 				var ccWin = cc;
+				// Liveness by strategy Id and the ids this AddOn started, read HERE on the request thread so the
+				// Control Center hop below reads cached grid fields and nothing else.
+				var ids = Ws_IdInfo();
 				// The Control Center owns a UI thread of its own, different from Globals.MainThreadDispatcher:
 				// a wrong-thread WPF read throws and reflection re-wraps it as a convincing null. Bounded, because
 				// the materialize path calls UpdateLayout. A timeout flies as the core's 504 — one target, one
 				// honest status code.
-				rows = Ui(ccWin.Dispatcher, () => Ws_ReadGrid(ccWin, materialize, notes), Ws_GridTimeout, "ControlCenter");
+				rows = Ui(ccWin.Dispatcher, () => Ws_ReadGrid(ccWin, materialize, notes, ids), Ws_GridTimeout, "ControlCenter");
 			}
 			// gridResolved:false means "we could not read the grid", never "there are no strategies": null, not [].
 			return Obj(
@@ -194,7 +197,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// could not be reached. Reads cached strings and bools off the grid entries only — no Cbi collection is
 		/// locked from this thread, which is how you deadlock a platform whose Cbi callbacks marshal back to it
 		/// (that is also why `accountPosition` is the grid's own string, not the live Position object).</summary>
-		private static string Ws_ReadGrid(Window cc, bool materialize, List<string> notes)
+		private static string Ws_ReadGrid(Window cc, bool materialize, List<string> notes, Ws_Ids ids)
 		{
 			var grid = Ws_Find<Gui.NinjaScript.StrategiesGrid>(cc);
 			if (grid == null)
@@ -224,13 +227,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 			{
 				var entry = e as Gui.NinjaScript.StrategiesGridEntry;
 				if (entry == null) continue;
-				items.Add(Ws_Row(entry, null));
+				items.Add(Ws_Row(entry, null, ids));
 				// The per-instrument child rows their SnapshotGrid dropped entirely.
 				var kids = entry.Children;
 				if (kids == null) continue;
 				string parent = Ws_RowName(entry);
 				foreach (var k in kids)
-					if (k != null && !ReferenceEquals(k, entry)) items.Add(Ws_Row(k, parent));
+					if (k != null && !ReferenceEquals(k, entry)) items.Add(Ws_Row(k, parent, ids));
 			}
 			return Arr(items);
 		}
@@ -316,23 +319,51 @@ namespace NinjaTrader.NinjaScript.AddOns
 			try { return NameOf(r.Strategy); } catch { return ""; }
 		}
 
-		private static string Ws_Row(Gui.NinjaScript.StrategiesGridEntryChild r, string parent)
+		/// <summary>Strategy Id -> the most alive state over every instance with that Id, and the Ids of the
+		/// runs this AddOn started (NT8BridgeDesk.cs / NT8BridgeStrategyRun.cs).</summary>
+		private sealed class Ws_Ids { public Dictionary<long, string> States; public HashSet<long> Bridge = new HashSet<long>(); }
+
+		private static Ws_Ids Ws_IdInfo()
+		{
+			Sr_Readopt();			// after a reload, take back the runs this AddOn started so they read startedByBridge
+			var ids = new Ws_Ids { States = Desk_IdStates(Desk_All()) };
+			lock (Sr_Gate)
+				foreach (var run in Sr_RunList)
+				{
+					if (run.StoppedUtc != null) continue;
+					try { if (run.Strat != null) ids.Bridge.Add(run.Strat.Id); } catch { }
+				}
+			return ids;
+		}
+
+		private static string Ws_Row(Gui.NinjaScript.StrategiesGridEntryChild r, string parent, Ws_Ids ids)
 		{
 			try
 			{
 				var strat = r.Strategy;
 				string state = null, type = null;
+				long id = 0;
 				if (strat != null)
 				{
 					try { state = strat.State.ToString(); } catch { }
 					try { type = strat.GetType().Name; } catch { }
+					try { id = strat.Id; } catch { }
 				}
+				string liveState = null;
+				if (id != 0 && ids != null) ids.States.TryGetValue(id, out liveState);
 				return Obj(
 					P("name", Q(Ws_RowName(r))),
 					P("parent", Q(parent)),					// null on a master row; the master's name on a per-instrument child
 					P("type", Q(type)),
 					P("enabled", r.IsEnabled ? "true" : "false"),	// grid state, NOT "is running" — believe `state`
 					P("state", Q(state)),
+					// The NinjaTrader strategy Id (a string: a long does not survive a double). NinjaTrader runs a
+					// clone that shares it, so `liveState` is the most alive state over EVERY instance with this Id
+					// and `instanceAlive` is true when one of them is in Configure..Realtime.
+					P("strategyId", id == 0 ? "null" : Q(id.ToString(CultureInfo.InvariantCulture))),
+					P("liveState", Q(liveState)),
+					P("instanceAlive", Desk_Active(liveState) ? "true" : "false"),
+					P("startedByBridge", id != 0 && ids != null && ids.Bridge.Contains(id) ? "true" : "false"),
 					P("account", Q(r.AccountName)),
 					P("instrument", Q(r.InstrumentName)),
 					P("connected", r.IsConnected ? "true" : "false"),

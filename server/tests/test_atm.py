@@ -51,8 +51,8 @@ class Atm:
     """The documented /atm/* behaviour, as a scriptable fake.
 
     armed=False      -> 403 on ALL FIVE paths, the reads included, before any body is parsed
-    flag_age_h > 24  -> the SAME 403: a stale flag is not a flag
-    any_live=True    -> 409 on every POST; the two reads still answer and report anyLive
+    flag_age_h       -> any age arms it: the flag stays armed until it is deleted
+    any_live=True    -> refuses nothing: a connection that can route orders may be up; status reports it
     sim=False        -> 403. There is no second file that widens this.
     atms             -> {atmId: {"filled": bool}}. An ATM with no live order and no position is
                         not listed and cannot be closed.
@@ -98,7 +98,7 @@ class Atm:
 
         # Gate 1 first, before the body is parsed. The READS are behind it too: a disarmed module
         # does not publish the user's ATM template names.
-        if not self.armed or self.flag_age_h > 24:
+        if not self.armed:
             return 403, {"error": UNARMED}
         if req.method == "GET":
             return 200, (self._templates() if verb == "templates" else self._status(req))
@@ -106,9 +106,6 @@ class Atm:
         body = json.loads(req.body) if req.body else {}
         self.posts.append(body)
 
-        if self.any_live:
-            return 409, {"error": "atm.%s refused: a live order-routing connection is up "
-                                  "(see /health.connections)" % verb, "anyLive": True}
         if not (body.get("account") or "").strip():
             return 400, {"error": "account is required — one name from GET /orders/status; "
                                   "there is no all-accounts form"}
@@ -302,7 +299,7 @@ class Atm:
                 for atm_id, row in sorted(self.atms.items())]
         if wanted:
             rows = [r for r in rows if r["account"].lower() == wanted.lower()]
-        return {"anyLive": self.any_live, "postsRefused": self.any_live, "account": wanted,
+        return {"anyLive": self.any_live, "account": wanted,
                 "atms": rows, "finished": 3, "hiddenNonSimulator": 2, "error": None, "note": "..."}
 
 
@@ -352,14 +349,13 @@ def test_unarmed_is_403_on_every_route_including_the_reads():
     assert len(atm.paths) == 5, "every tool must reach the AddOn and be refused there"
 
 
-def test_a_flag_older_than_24h_is_the_same_403_as_no_flag():
-    # A flag forgotten after one debugging session must not arm ATM entry for ever.
-    atm = Atm(flag_age_h=25.0)
-    assert _run(atm, nt8.nt_atm_start, **START) == {"error": UNARMED}
-    assert _run(Atm(flag_age_h=25.0), nt8.nt_atm_templates) == {"error": UNARMED}
+def test_an_old_flag_still_arms_the_module():
+    # The flag has no age limit: the user's opt-in lasts until the user deletes the file.
+    assert "confirm" in _run(Atm(flag_age_h=500.0), nt8.nt_atm_start, **START)
+    assert _run(Atm(flag_age_h=500.0), nt8.nt_atm_templates)["templates"] is not None
 
 
-# ── the provider rule and the live-routing guard ────────────────────────────
+# ── the provider rule ───────────────────────────────────────────────────────
 
 def test_a_non_simulator_account_is_refused_and_nothing_is_started():
     atm = Atm(sim=False)
@@ -373,16 +369,14 @@ def test_a_non_simulator_account_is_refused_and_nothing_is_started():
     assert atm.acted == 0 and atm.started == 0
 
 
-def test_a_live_routing_connection_refuses_the_writes_but_not_the_reads():
+def test_a_live_routing_connection_refuses_nothing_on_a_simulator_account():
     atm = Atm(any_live=True)
     with FakeAddon() as fake:
         _wire(fake, atm)
-        assert "live order-routing connection" in nt8.nt_atm_start(**START)["error"]
-        assert "live order-routing connection" in nt8.nt_atm_close(account="Sim101",
-                                                                   atm_id="a1")["error"]
-        # Listing templates and reading state routes nothing, so it answers and REPORTS anyLive.
+        assert "confirm" in nt8.nt_atm_start(**START)
+        assert "error" not in nt8.nt_atm_close(account="Sim101", atm_id="a1")
         status = nt8.nt_atm_status()
-        assert status["anyLive"] is True and status["postsRefused"] is True, status
+        assert status["anyLive"] is True and "postsRefused" not in status, status
         assert nt8.nt_atm_templates()["templates"] is not None
     assert atm.started == 0
 

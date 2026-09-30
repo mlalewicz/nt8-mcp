@@ -36,9 +36,10 @@ _GATES = """
     nothing: it may already have acted. Read nt_account first, then run a fresh dry run.
 
     OFF BY DEFAULT. Every /orders/* path answers 403 {"error":"orders module not armed"} unless a
-    file named orders.enabled sits in bin\\Custom\\AddOns and was written inside the past 24 hours
-    (stat-checked on every request, never cached). ops.enabled does not arm this. Every tool here is
-    also refused with 409 while any connection that can route orders is connected. One thing outlives
+    file named orders.enabled sits in bin\\Custom\\AddOns (stat-checked on every request, never
+    cached). The user creates it to opt in, and it stays armed until the user deletes it.
+    ops.enabled does not arm this. A connection that can route orders may be up: the provider check,
+    not the connection list, keeps every live account out of reach. One thing outlives
     the arming file: the exits of a bracket whose entry was accepted while the module WAS armed — see
     nt_order_bracket.
 

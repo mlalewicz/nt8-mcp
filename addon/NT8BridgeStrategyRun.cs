@@ -4,7 +4,7 @@
 // This module opens positions INDIRECTLY: a strategy it starts places its own orders. It therefore
 // goes through THE ONE DOOR in NT8BridgeOrders.cs — Ord_Guarded / Ord_Approve / Ord_Ok — and
 // nothing lower. Every gate in front of an order stands in front of a strategy start: the arming
-// file orders.enabled, RefuseIfLive, the account resolved to EXACTLY ONE Provider.Simulator or
+// file orders.enabled, the account resolved to EXACTLY ONE Provider.Simulator or
 // Provider.Playback account with the Backtest account refused by name, the caps read and signed,
 // the dry run, the ONE-SHOT confirm over the exact plan, the intent line before the act, and one
 // audit line per call. There is no live switch here either, and this file never reads ops.live.
@@ -34,6 +34,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Windows;
@@ -65,6 +66,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// <summary>Sanity bounds on DaysToLoad. NOTES.md lesson 48: a nonsense range made NinjaTrader load
 		/// until it stopped answering.</summary>
 		private const int Sr_MaxDaysToLoad = 3650;
+
+		/// <summary>The runs still active, in the nt8mcp folder under NinjaTrader's user data directory. Written
+		/// after every start and stop, read once per assembly load by Sr_Readopt.</summary>
+		private const string Sr_StoreName = "strategy_runs.json";
 
 		// ── the Control Center's own add / enable / disable path ────────────────
 		// StrategiesGrid is a PUBLIC type in NinjaTrader.Gui.dll, which NinjaTrader.Custom already
@@ -119,8 +124,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 		// No Stop_StrategyRun: this module subscribes to no event and owns no thread. It deliberately does
 		// NOT disable what it started at Stop() either — Stop() runs on every NinjaScript recompile, and
 		// turning a user's running strategy off on every F5 would be far worse than leaving it running.
-		// The consequence is stated in docs/api/strategyrun.md: a recompile empties Sr_Runs, the strategies
-		// keep running, and the Control Center grid row is what the user disables them from.
+		// A recompile starts this module with an empty registry while the strategies keep running;
+		// Sr_Readopt takes them back from strategy_runs.json on the first /strategy call after the reload.
 
 		/// <summary>Why this module cannot start a strategy on this build, or null. Checked on /strategy/start
 		/// AND on /strategy/stop: a strategy that could be started but not stopped is the one thing this
@@ -148,9 +153,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 			public Account Acct;
 			public StrategyBase Strat;
 			public string InputsJson, InputsText;
+			public bool BreakAtEod;
+			public string TradingHours;			// the template asked for; null = the instrument's own
 			public DateTime StartedUtc;
 			public DateTime? StoppedUtc;
 			public string StopNote;
+			public bool Readopted;				// taken back from strategy_runs.json after an assembly reload
 		}
 
 		private static readonly List<Sr_Run> Sr_RunList = new List<Sr_Run>();
@@ -180,6 +188,133 @@ namespace NinjaTrader.NinjaScript.AddOns
 				foreach (var r in Sr_RunList)
 					if (string.Equals(r.Id, id, StringComparison.OrdinalIgnoreCase)) return r;
 			return null;
+		}
+
+		// ── surviving an assembly reload ────────────────────────────────────────
+		private static readonly object Sr_StoreGate = new object();
+		private static readonly object Sr_ReadoptGate = new object();
+		private static bool Sr_ReadoptDone;
+
+		private static string Sr_StorePath() { return Path.Combine(Core.Globals.UserDataDir, "nt8mcp", Sr_StoreName); }
+
+		/// <summary>Write the runs that are still active. Called after every start and stop. A failed write is
+		/// logged and costs only the re-adoption after the next reload, never the start or the stop.</summary>
+		private static void Sr_Save()
+		{
+			try
+			{
+				Sr_Run[] snap;
+				lock (Sr_Gate) snap = Sr_RunList.Where(r => r.StoppedUtc == null).ToArray();
+				var rows = new List<string>();
+				foreach (var r in snap)
+				{
+					long sid = 0;
+					try { sid = r.Strat.Id; } catch { }
+					if (sid == 0) continue;
+					rows.Add(Obj(
+						P("id", Q(r.Id)),
+						P("strategyId", Q(sid.ToString(CultureInfo.InvariantCulture))),	// a string: a long does not survive a double
+						P("strategy", Q(r.Strategy)),
+						P("account", Q(r.Account)),
+						P("instrument", Q(r.Instrument)),
+						P("period", Q(r.Period)),
+						P("inputsJson", Q(r.InputsJson)),
+						P("inputsText", Q(r.InputsText)),
+						P("breakAtEod", r.BreakAtEod ? "true" : "false"),
+						P("tradingHours", Q(r.TradingHours)),
+						P("startedUtc", Q(r.StartedUtc.ToString("o", CultureInfo.InvariantCulture)))));
+				}
+				lock (Sr_StoreGate)
+				{
+					string p = Sr_StorePath();
+					Directory.CreateDirectory(Path.GetDirectoryName(p));
+					File.WriteAllText(p + ".tmp", Obj(P("runs", Arr(rows))));
+					if (File.Exists(p)) File.Replace(p + ".tmp", p, null);
+					else File.Move(p + ".tmp", p);
+				}
+			}
+			catch (Exception ex) { Log("/strategy save " + Sr_StoreName + ": " + Deep(ex)); }
+		}
+
+		/// <summary>ONCE per assembly load, on the first /strategy call: take back the runs the previous load
+		/// started. A NinjaScript recompile reloads this AddOn with an empty registry while its strategies keep
+		/// running, so without this POST /strategy/stop could no longer reach them. A row comes back only when an
+		/// instance with its strategy id is still in StrategyBase.All, not Finalized, and still carries a
+		/// Simulator or Playback account of the SAME name — the provider gate is applied again here, never
+		/// taken from the file. The rest are dropped from the file and logged. The whole pass runs under one
+		/// lock, so a second first-call waits for it and never numbers a new run before the old ids are back.</summary>
+		private static void Sr_Readopt()
+		{
+			lock (Sr_ReadoptGate)
+			{
+				if (Sr_ReadoptDone) return;
+				Sr_ReadoptDone = true;
+
+				List<object> saved;
+				StrategyBase[] all;
+				try
+				{
+					string p = Sr_StorePath();
+					if (!File.Exists(p)) return;
+					var doc = ParseJson(File.ReadAllText(p)) as Dictionary<string, object>;
+					saved = JGet(doc, "runs") as List<object>;
+					if (saved == null || saved.Count == 0) return;
+					all = StrategyBase.All.ToArray();
+				}
+				catch (Exception ex) { Log("/strategy re-adopt: " + Sr_StoreName + " unreadable — " + Deep(ex)); return; }
+
+				int adopted = 0, dropped = 0, maxN = 0;
+				foreach (var o in saved)
+				{
+					try
+					{
+						var d = o as Dictionary<string, object>;
+						if (d == null) { dropped++; continue; }
+						string id = JGetStr(d, "id", ""), accountName = JGetStr(d, "account", "");
+						long sid;
+						if (!long.TryParse(JGetStr(d, "strategyId", ""), NumberStyles.Integer, CultureInfo.InvariantCulture, out sid)
+							|| sid == 0 || id.Length == 0 || Sr_Find(id) != null) { dropped++; continue; }
+
+						StrategyBase live = null;
+						foreach (var s in all)
+						{
+							try { if (s != null && s.Id == sid && s.State != State.Finalized) { live = s; break; } }
+							catch { }
+						}
+						string error;
+						Account a = live == null ? null : Sr_AccountOf(live, out error);
+						string liveName = a == null ? null : Ops_AccountName(a);
+						if (live == null || a == null || !Ord_IsSim(a) || Ord_IsBacktestAccount(liveName)
+							|| !string.Equals(liveName, accountName, StringComparison.OrdinalIgnoreCase)) { dropped++; continue; }
+
+						string inputsJson = JGetStr(d, "inputsJson", null);
+						try { if (inputsJson != null && !(ParseJson(inputsJson) is Dictionary<string, object>)) inputsJson = null; }
+						catch { inputsJson = null; }
+						DateTime started;
+						if (!DateTime.TryParse(JGetStr(d, "startedUtc", ""), CultureInfo.InvariantCulture,
+								DateTimeStyles.RoundtripKind, out started)) started = DateTime.UtcNow;
+						int n;
+						if (id.StartsWith("s", StringComparison.Ordinal)
+							&& int.TryParse(id.Substring(1), NumberStyles.Integer, CultureInfo.InvariantCulture, out n) && n > maxN) maxN = n;
+
+						Sr_Register(new Sr_Run
+						{
+							Id = id, Strategy = JGetStr(d, "strategy", null), Account = liveName,
+							Instrument = JGetStr(d, "instrument", null), Period = JGetStr(d, "period", null),
+							Acct = a, Strat = live, InputsJson = inputsJson,
+							InputsText = JGetStr(d, "inputsText", null), BreakAtEod = JGetBool(d, "breakAtEod", true),
+							TradingHours = JGetStr(d, "tradingHours", null), StartedUtc = started, Readopted = true
+						});
+						adopted++;
+					}
+					catch (Exception ex) { dropped++; Log("/strategy re-adopt: one row skipped — " + Deep(ex)); }
+				}
+
+				// New ids continue after the highest one taken back, so an id never names two runs.
+				if (Sr_Counter < maxN) Sr_Counter = maxN;
+				Log("/strategy re-adopt: " + adopted + " run(s) taken back, " + dropped + " dropped");
+				if (dropped > 0) Sr_Save();
+			}
 		}
 
 		// ── small readers ───────────────────────────────────────────────────────
@@ -398,7 +533,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// `assignId` is false for the probe instance a dry run builds and throws away: SetUniqueId is what
 		/// puts a row in NinjaTrader's strategy DB, and a dry run must leave nothing behind.</summary>
 		private static StrategyBase Sr_Build(Type t, Account acct, Instrument inst, Data.BarsPeriod bp,
-			int? daysToLoad, List<KeyValuePair<PropertyInfo, object>> inputs, bool assignId)
+			int? daysToLoad, bool breakAtEod, Data.TradingHours th,
+			List<KeyValuePair<PropertyInfo, object>> inputs, bool assignId)
 		{
 			var s = (StrategyBase)t.Assembly.CreateInstance(t.FullName);
 			if (s == null) throw new Exception("could not construct " + t.FullName);
@@ -410,6 +546,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 				s.Instrument = inst;
 				s.InstrumentOrInstrumentList = inst.FullName;		// what the Control Center's own validation reads
 				s.BarsPeriod = bp;
+				// The two "Time frame" settings of the Strategies dialog: Break at EOD and Trading hours.
+				s.IsStableSession = breakAtEod;
+				if (th != null) s.TradingHoursInstance = th;		// unset = the instrument's own trading hours
 				if (daysToLoad != null) s.DaysToLoad = daysToLoad.Value;
 				s.Category = Category.NinjaScript;
 				if (assignId) s.SetUniqueId();
@@ -433,22 +572,27 @@ namespace NinjaTrader.NinjaScript.AddOns
 		{
 			public readonly List<KeyValuePair<string, object>> Inputs = new List<KeyValuePair<string, object>>();
 			public string ConfigProblem;
+			public bool? BreakAtEod;			// read back off the configured instance; null = unreadable
+			public string TradingHours;			// its TradingHoursInstance name; null = unset or unreadable
 		}
 
 		private static Sr_Shape Sr_Probe(Type t, Account acct, Instrument inst, Data.BarsPeriod bp,
-			int? daysToLoad, List<KeyValuePair<PropertyInfo, object>> applied, List<PropertyInfo> props)
+			int? daysToLoad, bool breakAtEod, Data.TradingHours th,
+			List<KeyValuePair<PropertyInfo, object>> applied, List<PropertyInfo> props)
 		{
 			var shape = new Sr_Shape();
 			StrategyBase s = null;
 			try
 			{
-				s = Sr_Build(t, acct, inst, bp, daysToLoad, applied, false);
+				s = Sr_Build(t, acct, inst, bp, daysToLoad, breakAtEod, th, applied, false);
 				foreach (var p in props)
 				{
 					object v;
 					try { v = p.GetValue(s, null); } catch { v = null; }
 					shape.Inputs.Add(new KeyValuePair<string, object>(p.Name, v));
 				}
+				try { shape.BreakAtEod = s.IsStableSession; } catch { }
+				try { var x = s.TradingHoursInstance; shape.TradingHours = x == null ? null : x.Name; } catch { }
 				shape.ConfigProblem = Sr_ConfigProblem(s);
 			}
 			finally { if (s != null) Sr_TearDown(s); }
@@ -488,6 +632,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		{
 			Ord_Call call = g.Call;
 			Ord_CapSet caps = g.Caps;
+			Sr_Readopt();			// old ids first, so a new run never takes one of them
 
 			string blocked = Sr_Blocked();
 			if (blocked != null) return Ord_Err(call, 501, "notAvailable", blocked);
@@ -534,6 +679,20 @@ namespace NinjaTrader.NinjaScript.AddOns
 				daysToLoad = d;
 			}
 
+			// ── Break at EOD and trading hours ──────────────────────────────────
+			// Break at EOD defaults to ON, like the Strategies dialog and like /backtest without a chart,
+			// so a run builds the same bars its backtest did.
+			bool breakAtEod = JGetBool(g.Body, "breakAtEod", true);
+			Data.TradingHours th = null;
+			string thName = (JGetStr(g.Body, "tradingHours", "") ?? "").Trim();
+			if (thName.Length > 0)
+			{
+				try { th = Data.TradingHours.Get(thName); } catch (Exception ex) { Log("/strategy/start TradingHours.Get: " + Deep(ex)); }
+				if (th == null)
+					return Ord_Err(call, 400, "badRequest", "no trading hours template named '" + thName
+						+ "' — omit tradingHours to use the instrument's own");
+			}
+
 			// ── inputs ──────────────────────────────────────────────────────────
 			List<PropertyInfo> props = Sr_InputProps(t);
 			var applied = new List<KeyValuePair<PropertyInfo, object>>();
@@ -560,7 +719,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			// the configured strategy really reads it back rather than only the keys the caller sent.
 			// A TimeoutException flies as the core's 504 — one target, one honest status code.
 			Sr_Shape shape = Ui(cc.Dispatcher,
-				() => Sr_Probe(t, g.Account, inst, bp, daysToLoad, applied, props), Sr_UiTimeout, "ControlCenter");
+				() => Sr_Probe(t, g.Account, inst, bp, daysToLoad, breakAtEod, th, applied, props), Sr_UiTimeout, "ControlCenter");
 
 			if (shape.ConfigProblem != null)
 				return Ord_Err(call, 400, "configurationRejected", "NinjaTrader rejects this configuration: "
@@ -577,6 +736,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 				+ "|INSTRUMENT=" + instFull
 				+ "|PERIOD=" + periodText
 				+ "|DAYSTOLOAD=" + (daysToLoad == null ? "default" : daysToLoad.Value.ToString(CultureInfo.InvariantCulture))
+				+ "|BREAKATEOD=" + (breakAtEod ? "true" : "false")
+				+ "|TRADINGHOURS=" + (th == null ? "instrument" : th.Name)
 				+ "|INPUTS=" + inputsText
 				+ "|" + caps.Text;
 
@@ -586,6 +747,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 				P("instrument", Q(instFull)),
 				P("barsPeriod", Sr_PeriodJson(bp)),
 				P("daysToLoad", daysToLoad == null ? "null" : I(daysToLoad.Value)),
+				P("breakAtEod", breakAtEod ? "true" : "false"),
+				P("tradingHours", Q(th == null ? null : th.Name)),
+				// Read back off the configured instance, the way the dialog would show them.
+				P("breakAtEodObserved", shape.BreakAtEod == null ? "null" : (shape.BreakAtEod.Value ? "true" : "false")),
+				P("tradingHoursObserved", Q(shape.TradingHours)),
 				P("inputs", inputsJson),
 				P("placesItsOwnOrders", "true"),
 				P("appearsIn", Q("the Control Center Strategies grid")));
@@ -600,7 +766,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			{
 				strat = Ui(cc.Dispatcher, () =>
 				{
-					var s = Sr_Build(t, g.Account, inst, bp, daysToLoad, applied, true);
+					var s = Sr_Build(t, g.Account, inst, bp, daysToLoad, breakAtEod, th, applied, true);
 					try { Sr_Add.Invoke(null, new object[] { s }); }
 					catch { Sr_TearDown(s); throw; }
 					return s;
@@ -653,6 +819,14 @@ namespace NinjaTrader.NinjaScript.AddOns
 			// to Finalized and another instance with the same Id runs in the grid. Every later read and
 			// the stop must use that live instance, or a running strategy reads as "Finalized".
 			var live = Sr_Live(strat);
+			// The clone can reach StrategyBase.All a moment AFTER the original reads Finalized (seen with a
+			// fast 5-day load): wait for it, or a strategy that is running is reported as unverified.
+			var cloneUntil = DateTime.UtcNow.AddMilliseconds(Sr_SettleMs);
+			while (ReferenceEquals(live, strat) && state != null && Sr_Ended(state) && DateTime.UtcNow < cloneUntil)
+			{
+				System.Threading.Thread.Sleep(Sr_PollMs);
+				live = Sr_Live(strat);
+			}
 			if (!ReferenceEquals(live, strat))
 			{
 				strat = live;
@@ -665,9 +839,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 				Id = "s" + System.Threading.Interlocked.Increment(ref Sr_Counter).ToString(CultureInfo.InvariantCulture),
 				Strategy = t.Name, Account = g.AccountName, Instrument = instFull, Period = periodText,
 				Acct = g.Account, Strat = strat, InputsJson = inputsJson, InputsText = inputsText,
+				BreakAtEod = breakAtEod, TradingHours = th == null ? null : th.Name,
 				StartedUtc = DateTime.UtcNow
 			};
 			Sr_Register(row);
+			Sr_Save();
 
 			// READ-BACK 2, after the enable has been dispatched and the state has settled: OnStateChange
 			// runs there, and State.Configure is exactly where a strategy would assign its own Account. The
@@ -699,6 +875,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 				P("instrument", Q(instFull)),
 				P("barsPeriod", Sr_PeriodJson(bp)),
 				P("daysToLoad", daysToLoad == null ? "null" : I(daysToLoad.Value)),
+				P("breakAtEod", breakAtEod ? "true" : "false"),
+				P("tradingHours", Q(th == null ? null : th.Name)),
 				P("inputs", inputsJson),
 				P("state", Q(state)),
 				P("running", running ? "true" : "false"),
@@ -761,10 +939,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (id.Length == 0)
 				return Ord_Err(call, 400, "badRequest", "id is required — an id from GET /strategy/running");
 
+			Sr_Readopt();
 			Sr_Run row = Sr_Find(id);
 			if (row == null)
 				return Ord_Err(call, 404, "noSuchRun", "no strategy run '" + id + "' — this module can only stop "
-					+ "instances it started itself, and a NinjaScript recompile empties that list. Call "
+					+ "instances it started itself (runs from before a NinjaScript recompile come back only while "
+					+ "their instance still runs on the same Simulator or Playback account). Call "
 					+ "GET /strategy/running for the ids, or disable the row in the Control Center by hand");
 			if (!string.Equals(row.Account, g.AccountName, StringComparison.OrdinalIgnoreCase))
 				return Ord_Err(call, 409, "accountMismatch", "run '" + id + "' runs on '" + row.Account
@@ -935,6 +1115,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 				row.StoppedUtc = DateTime.UtcNow;
 				row.StopNote = removeNote;
 			}
+			Sr_Save();
 
 			call.Status = ended ? 200 : 502;
 			call.Outcome = ended ? "strategyStopped" : "strategyStopUnverified";
@@ -982,8 +1163,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// Control Center grid — that is GET /strategies/running, which is read-only and lists every row,
 		/// whoever created it.
 		///
-		/// A READ, so gate 1 (armed) only: the order-routing guard restricts what can route or disturb
-		/// orders, and reading a strategy's state routes nothing. anyLive is reported instead.
+		/// A READ, so gate 1 (armed) only: reading a strategy's state routes nothing. anyLive is reported
+		/// for information.
 		///
 		/// Nothing here hops to the Control Center's dispatcher: State and SystemPerformance are plain CLR
 		/// members and the Cbi collections are snapshotted under their own locks with every member read
@@ -992,6 +1173,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		private static string Sr_RunningJson(Ord_Call call)
 		{
 			call.Outcome = "read";
+			Sr_Readopt();
 			Sr_Run[] snap;
 			lock (Sr_Gate) snap = Sr_RunList.ToArray();
 
@@ -1024,12 +1206,28 @@ namespace NinjaTrader.NinjaScript.AddOns
 						if (rt == null) perfError = "RealTimeTrades is null";
 						else
 						{
-							trades = rt.Count;
+							// TradesCount, not Count: a collection that keeps no Trade objects counts 0 items
+							// while its TradesCount and TradesPerformance still add up every trade.
+							trades = rt.TradesCount;
 							realized = rt.TradesPerformance.Currency.CumProfit;
 						}
 					}
 				}
 				catch (Exception ex) { perfError = Deep(ex); }
+
+				// Break at EOD and the trading hours the live bars were BUILT with — the measurement, beside
+				// what the run asked for.
+				string barsEod = "null", barsTh = null;
+				try
+				{
+					var b = r.Strat.BarsArray == null || r.Strat.BarsArray.Length == 0 ? null : r.Strat.BarsArray[0];
+					if (b != null)
+					{
+						barsEod = b.IsResetOnNewTradingDay ? "true" : "false";
+						barsTh = b.TradingHours == null ? null : b.TradingHours.Name;
+					}
+				}
+				catch { }
 
 				rows.Add(Obj(
 					P("id", Q(r.Id)),
@@ -1042,6 +1240,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 					P("accountError", Q(acctError)),
 					P("instrument", Q(r.Instrument)),
 					P("barsPeriod", Q(r.Period)),
+					P("breakAtEod", r.BreakAtEod ? "true" : "false"),
+					P("tradingHours", Q(r.TradingHours)),
+					P("barsBreakAtEod", barsEod),			// null = the bars could not be read yet
+					P("barsTradingHours", Q(barsTh)),
+					P("readopted", r.Readopted ? "true" : "false"),
 					P("inputs", r.InputsJson ?? "null"),
 					P("startedAt", Tm(r.StartedUtc.ToLocalTime())),
 					P("stoppedAt", r.StoppedUtc == null ? "null" : Tm(r.StoppedUtc.Value.ToLocalTime())),
@@ -1075,10 +1278,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 				P("cannotStartBecause", Q(Sr_Blocked())),
 				P("anyLive", AnyLiveConnected() ? "true" : "false"),
 				P("flags", Ord_FlagJson(true, call.FlagAgeHours)),
-				P("note", Q("These are the instances THIS module started in THIS assembly load. A NinjaScript "
-					+ "recompile hot-reloads the AddOn and empties this list while the strategies keep "
-					+ "running: they stay in the Control Center Strategies grid, which GET /strategies/running "
-					+ "lists in full and which is where they are then disabled by hand. `state` is the "
+				P("note", Q("These are the instances THIS module started. A NinjaScript recompile hot-reloads the "
+					+ "AddOn while the strategies keep running; the first /strategy call after it takes back "
+					+ "(`readopted`: true) every run whose instance still runs on the same Simulator or Playback "
+					+ "account. Any other row stays in the Control Center Strategies grid, which "
+					+ "GET /strategies/running lists in full and where it is disabled by hand. "
+					+ "`barsBreakAtEod` and `barsTradingHours` are what the live bars were built with. `state` is the "
 					+ "evidence, not `running` on a grid row: only \"Realtime\" is trading, and null means "
 					+ "the instance could not be read. `account` is the account the run was STARTED on; "
 					+ "`accountObserved` is the one the instance carries now, read off it each time — when "

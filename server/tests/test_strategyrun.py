@@ -51,7 +51,8 @@ class Runner:
     armed=False    -> 403 on all three paths, whatever else is true, body parsed or not
     can_start=False-> 501 on start and stop: the Control Center's add/enable/disable path is not on
                       this NinjaTrader build, so nothing is started rather than started invisibly
-    any_live=True  -> 409 on start and stop; /strategy/running still answers and reports anyLive
+    any_live=True  -> refuses nothing: a connection that can route orders may be up (the provider
+                      check keeps live accounts out); /strategy/running reports anyLive
     sim=False      -> 403. There is no second file that widens this.
     state          -> what the instance reports after the enable settles. "Realtime" is running;
                       "Historical" is a strategy still loading bars, which is NOT a failure.
@@ -107,9 +108,6 @@ class Runner:
         body = json.loads(req.body) if req.body else {}
         self.posts.append(body)
 
-        if self.any_live:
-            return 409, {"error": "orders strategy.%s refused: a live order-routing connection is "
-                                  "up (see /health.connections)" % verb, "anyLive": True}
         if not (body.get("account") or "").strip():
             return 400, {"error": "account is required — one name from GET /orders/status; "
                                   "there is no all-accounts form"}
@@ -310,19 +308,57 @@ def test_the_disarmed_refusal_is_the_same_sentence_the_order_tools_use():
 
 
 # ---------------------------------------------------------------------------
-# gate 2 / gate 3: live routing, and the provider
+# gates 2 and 3: the account and its provider
 # ---------------------------------------------------------------------------
 
-def test_a_live_routing_connection_refuses_start_and_stop_but_not_the_read():
+def test_a_broker_price_feed_does_not_block_start_or_stop_on_a_simulator_account():
     runner = Runner(any_live=True)
     with _addon(runner):
-        assert "live order-routing connection is up" in _start()["error"]
-        assert "live order-routing connection is up" in tools_strategyrun.nt_strategy_stop(
-            id="s1", account="Sim101")["error"]
+        start = _start()
+        assert "error" not in start and "confirm" in start, start
+        stop = tools_strategyrun.nt_strategy_stop(id="s1", account="Sim101")
+        assert "error" not in stop, stop
         read = tools_strategyrun.nt_strategy_runs()
         assert read["anyLive"] is True
         assert read["count"] == 1
+    assert runner.started == 0      # dry runs only: nothing started without a confirm
+
+
+def test_a_broker_price_feed_does_not_widen_the_provider_gate():
+    runner = Runner(any_live=True, sim=False)
+    with _addon(runner):
+        err = _start(account="MyBrokerAccount")["error"]
+    assert "Provider.Simulator or Provider.Playback" in err
     assert runner.started == 0
+
+
+def test_start_and_stop_wait_longer_than_the_default_http_timeout():
+    # The AddOn answers a start only after the enable settles; a 5 s client deadline turned a strategy
+    # that DID start into "not reachable". Shrink the module default and delay the fake past it.
+    from nt8_mcp import app
+    runner = Runner()
+    slow = lambda req: (time.sleep(0.6), runner(req))[1]
+    saved = app.HTTP_TIMEOUT
+    app.HTTP_TIMEOUT = 0.2
+    try:
+        fake = FakeAddon()
+        for path in ("/strategy/start", "/strategy/stop"):
+            fake.register(path, "POST", slow)
+        with fake:
+            assert "confirm" in _start()
+            assert "error" not in tools_strategyrun.nt_strategy_stop(id="s1", account="Sim101")
+    finally:
+        app.HTTP_TIMEOUT = saved
+
+
+def test_break_at_eod_and_trading_hours_are_sent_only_when_given():
+    runner = Runner()
+    with _addon(runner):
+        _start()
+        _start(break_at_eod=False, trading_hours="CME US Index Futures ETH")
+    assert "breakAtEod" not in runner.posts[0] and "tradingHours" not in runner.posts[0]
+    assert runner.posts[1]["breakAtEod"] is False
+    assert runner.posts[1]["tradingHours"] == "CME US Index Futures ETH"
 
 
 def test_a_non_simulator_account_is_refused_and_there_is_no_file_that_widens_it():

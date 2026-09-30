@@ -52,13 +52,16 @@ and nothing else: no flag ages, no account names, no hint about what would have 
 endpoint list is not advertised either (see `/compat` below). An unarmed call is **not** audited,
 because it never reached the account layer.
 
-**2. `AnyLiveConnected()`.** Both POSTs go through the core's one guard,
-`RefuseIfLive(…, force:false)`, and are refused with `409 {"error":"ops … refused: a live
+**2. `AnyLiveConnected()`.** `POST /ops/reconnect` goes through the core's one guard,
+`RefuseIfLive(…, force:false)`, and is refused with `409 {"error":"ops … refused: a live
 order-routing connection is up …","anyLive":true}` while any Connected connection is neither
-Simulator nor Playback and can manage orders. There is no `force` on either endpoint.
-`GET /ops/status` is deliberately **not** behind this guard — the order-routing guard restricts
-only what can route or disturb orders, and listing account names routes nothing. It reports
-`anyLive` and `postsRefused` instead, so the state is visible rather than guessed at from a 409.
+Simulator nor Playback and can manage orders. `POST /ops/flatten` goes through the same guard only
+when the account is **not** a Simulator/Playback account — reachable at all, in that case, only
+through `ops.live` — so a Simulator or Playback account can be flattened whatever connection is up.
+On `/ops/flatten` the account checks (missing account, account not found, non-Simulator without
+`ops.live`) run **before** this guard. There is no `force` on either endpoint. `GET /ops/status` is
+deliberately **not** behind this guard — listing account names routes nothing. It reports `anyLive`
+for information only.
 
 **3. `ops.live`.** A second file, same folder. Its **presence** — whoever wrote it, no age rule — is
 what makes a non-Simulator account a valid target. Without it a non-Simulator account is not even
@@ -111,7 +114,6 @@ possibly the flatten's.
 { "flags": { "armed": true, "flagName": "ops.enabled", "flagAgeHours": 0.12,
              "flagMaxAgeHours": 24, "live": false, "liveName": "ops.live", "liveAgeHours": null },
   "anyLive": false,
-  "postsRefused": false,
   "complete": true, "error": null,
   "accounts": [ { "name": "Sim101", "provider": "Simulator", "simulator": true,
                   "openPositions": 1, "workingOrders": 2, "error": null } ],

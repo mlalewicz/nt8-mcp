@@ -1,5 +1,139 @@
 # Changelog
 
+## 1.5.0 — 2026-09-30
+
+### Sim desk
+
+Tools for the day after a platform crash, when the Control Center Strategies grid comes back with
+every strategy disabled, stale rows and orphaned working orders. The writes are Simulator/Playback
+only, need `orders.enabled`, a dry run and a signed one-shot confirm, and the local NT8 lock. Full
+contract: `docs/api/desk.md`.
+
+- **`nt_desk_status`** (read): process start, the last Session Break, connections, expected legs
+  vs enabled vs Realtime, duplicates, orphaned orders, trace age, and legs silent past their
+  decision time.
+- **`nt_cancel_orphans`**: cancels every working order whose owning strategy instance is dead,
+  under one plan and one confirm.
+- **`nt_grid_remove`**: removes one disabled, dead Strategies-grid row that this server did not
+  start.
+- **`nt_grid_enable`**: re-enables one existing row, only when its (strategy, account, instrument)
+  is in the allowlist file `desk_legs.json` (outside the repository; no file = always refused) and
+  no other row of the same (strategy, account) is enabled or alive.
+- **`nt_desk_recover`**: restart recovery in one call. The dry run lists every allowlisted leg with
+  no enabled/Realtime row and the one disabled, dead row it would enable; a leg with 0 or more than
+  1 candidate rows is refused, never guessed. One confirm enables them all, then the grid is read
+  again: only Realtime counts as enabled.
+- **`nt_leg_decisions`** (read): the last lines of each leg's own decisions file
+  (`nt8mcp\decisions\<strategy>_<account>.csv`, columns `date_et,time_et,decision,reason,inputs`).
+  A leg with an optional `"decision_time": "HH:MM"` (ET) in `desk_legs.json` is flagged
+  `noLineToday` past that time on a weekday with no line for today; `nt_desk_status` lists it under
+  `silentLegs`.
+- **`nt_crash_report`** (read): the trace lines before the last Session Break, and the Windows
+  events 41/1074/6008/1000/1026 around it.
+- **`nt_lock`**: takes, renews or releases the local NT8 lock (`nt8.lock`, holder + expiry,
+  `NT8MCP_LOCK_FILE` overrides) that the three writes above need.
+- **Strategy and owner ids.** `GET /strategies/running` rows carry `strategyId`, `liveState`,
+  `instanceAlive` and `startedByBridge`. Order rows in `GET /account` and `GET /orders/status`, and
+  the `/orders/cancel` plan, carry `ownerStrategyId`, `ownerState` and `ownerAlive`. A strategy
+  owner reads `strategy <name> #<id> alive|dead`; when `GetOwnerStrategy()` answers null (a
+  disabled, terminated instance) the owner is found in every instance's own `Orders`.
+- New AddOn paths: `GET /desk/orphans`, `POST /desk/cancelOrphans`, `POST /desk/gridRemove`,
+  `POST /desk/gridEnable`.
+
+### Lint
+
+- **`nt_lint`** (MCP and `scripts/nt_lint.py`, no AddOn needed): a static NinjaScript hazard scan.
+  NT01 cross-instrument series in an indicator (use `BarsRequest`), NT02 market depth subscribed
+  on a pool thread with no `Dispatcher.Run`, NT03 `Thread.Suspend/Resume/Abort`, NT04 file writes
+  reached from a data event with no `State.Realtime` guard, NT04N any network call, NT05 strategy
+  entries with no cancel of its own working orders when it leaves Realtime, NT06 unguarded `Print`
+  in `OnBarUpdate`/`OnMarketData`, NT07 Process/Registry/Delete/Exit, NT08 synchronous
+  `Dispatcher.Invoke` from a data event, NT09 invisible Unicode and encoded blobs. Comments and
+  strings are blanked before the scan. Per finding: rule, line, severity, fix hint. See
+  `docs/api/lint.md`.
+
+### Match
+
+- **`nt_match`** (MCP only, no new AddOn path): the NT8 trade match. Compares NinjaTrader's trades
+  (an exported CSV/JSON, a status doc, a backtest id, a saved run, or a new `nt_backtest` run) with
+  a research reference CSV, per entry. Scale-out rows are grouped into one entry. Pairs by session
+  date + side (+ entry time within `entry_tol_min`), then checks the entry price, the exit type
+  (target/stop/time/other) and the exit price within `price_tol_ticks`. Exit mismatches are
+  checked on 1-minute bars (`bars_csv` or `nt_bars`) for a stop and a target inside one bar
+  ("ambiguous"); 08:30/10:00/14:00 minutes are flagged. Returns % on date + side, % on full
+  outcome with and without the ambiguous rows, a per-mismatch table and PASS/FAIL against a
+  threshold (default 95%). Reference column names map through `columns`. See `docs/api/match.md`.
+
+### Strategy start on Sim
+
+- **`POST /strategy/start` takes `breakAtEod` and `tradingHours`.** `breakAtEod` (default `true`)
+  sets the Strategies dialog's own "Break at EOD" — the same default a chartless backtest uses, so
+  a live run builds the bars its backtest did; without it, 10/30/60-minute bars can drift off the
+  hour after an early close. `tradingHours` names a trading hours template (for example
+  `"CME US Index Futures ETH"`); omitted, the instrument's own applies, and an unknown name is a
+  `400`. Both are in the signed plan and in the response; the plan also reports what the configured
+  strategy reads them back as (`breakAtEodObserved`, `tradingHoursObserved`). MCP:
+  `nt_strategy_start(..., break_at_eod=None, trading_hours=None)`.
+- **A strategy run survives a NinjaScript recompile.** Every start and stop writes the active runs
+  to `strategy_runs.json` under NinjaTrader's user data folder; the first `/strategy` call after a
+  reload takes each one back under its original id, as long as an instance with that run's
+  strategy id is still running on the same Simulator or Playback account (the provider check runs
+  again — the file is never trusted on its own). A run that does not pass keeps its grid row and is
+  disabled there by hand. `GET /strategy/running` rows gain `readopted`, and `breakAtEod` /
+  `tradingHours` (what the run asked for) next to `barsBreakAtEod` / `barsTradingHours` (what the
+  live bars were built with).
+- **`nt_backtest` takes `break_at_eod`** ("Break at EOD"). Omitted, it is the chart's own setting
+  with `chart=`, else `true`, what a new chart or a Strategy Analyzer series uses. The status doc
+  echoes it as `breakAtEod`.
+
+### Changed
+
+- **`orders.enabled` does not expire.** The arming file for order entry, ATM strategies,
+  strategies-on-Sim and the Playback controls stays armed until you delete it. `GET /orders/status`
+  still reports `flagAgeHours`; `flagMaxAgeHours` is gone. `ops.enabled` is unchanged: ignored
+  after 24 hours.
+- **Order entry, ATM and strategy start/stop do not refuse because a connection is up.**
+  `/orders/*`, `/atm/*`, `/strategy/start` and `/strategy/stop` never answer `409` for a live
+  connection and never report `refusedLive`. The Simulator/Playback provider check keeps real money
+  out of reach: it refuses every account a broker connection owns, whatever else is Connected. A
+  broker connection is often the price feed of a Simulator account. `GET /orders/status` and
+  `GET /atm/status` drop `postsRefused`; both still report `anyLive`. A bracket's exits after a
+  fill are logged `bracketExits` / `bracketExitsPartial`, or `bracketDisarmed` when
+  `orders.enabled` is absent; `bracketLiveConnection` is gone.
+- **`POST /ops/flatten` flattens a Simulator or Playback account whatever connection is up.** Its
+  live-connection guard applies only to a non-Simulator account (reachable only through
+  `ops.live`); the account checks run first. `POST /ops/reconnect` is unchanged: refused while any
+  such connection is up. `GET /ops/status` drops `postsRefused`.
+- The Playback arming message reads `orders.enabled is absent`.
+
+### Fixes
+
+- **A strategy start is not reported as failed while it runs.** `POST /strategy/start` waits for
+  the instance NinjaTrader really runs (it enables a copy of the one it is handed) before it
+  answers; a fast load could answer `502 strategyUnverified` for a running strategy.
+  `nt_strategy_start` and `nt_strategy_stop` wait up to 60 s for that answer.
+- **`realtimeTrades` matches `realizedPnL`.** `GET /strategy/running` counts real-time trades from
+  `TradesCount`, not from the in-memory trade collection, which stays empty for a live run.
+- **Indicator plots in multi-series indicators.** `nt_indicators` reads plot values off
+  `BarsArray[0]`: in a multi-series indicator `Bars` follows the series that updated last, so
+  every value read null. Each plot also carries `last`, its newest valid point, because an
+  `OnBarClose` indicator has no value on the forming bar.
+
+### Known limitations
+
+- `nt_grid_enable` re-enables an existing row. NinjaTrader keeps a re-enabled strategy on its old
+  compiled code: after a recompile, remove the row and add the strategy again to run the new code.
+- The Sim desk writes rely on NinjaTrader behaviour that is not documented (what
+  `GetOwnerStrategy()` and a strategy's `Orders` return for a terminated instance, what
+  `StrategyEnable` does with an existing row). Read `nt_desk_status` and the dry run before the
+  first confirm.
+- The NT8 lock is advisory, enforced in the MCP server. It coordinates agents that share one
+  NinjaTrader; it is not a security gate, and the AddOn does not check it.
+- `nt_match` compares exit prices as given: a reference that records a time exit at a different bar
+  will differ.
+- `nt_lint` is a pattern scan, not a compiler: it can miss a hazard built through indirection, and
+  a finding can be a false alarm. Read each one.
+
 ## 1.4.0 — 2026-09-20
 
 ### Added

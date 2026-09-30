@@ -21,8 +21,8 @@
 //   Ord_Ok(call, outcome, detail, pairs…)                      the result line, after the act
 //
 // A later module (ATM templates, strategies on a Simulator account) adds its own file with its own
-// Route_<Module> and calls Ord_Guarded from it. It does not repeat the flag test, the live-routing
-// test, the provider test, the caps, the token or the audit log — and it cannot weaken any of them,
+// Route_<Module> and calls Ord_Guarded from it. It does not repeat the flag test, the account and
+// provider tests, the caps, the token or the audit log — and it cannot weaken any of them,
 // because none of them takes a parameter that turns it off.
 //
 // Members whose name starts with Ord_Raw are the LOW-LEVEL pieces the door is built from — they
@@ -31,13 +31,16 @@
 // NINE gates stand in front of every state change, in this order. Gate 1 answers before the body
 // is parsed; every refusal from gate 2 onwards is audited:
 //   1. orders.enabled beside the AddOn in bin\Custom\AddOns, stat-checked on EVERY request, never
-//      cached, IGNORED when older than 24 h or future-dated. Unarmed -> 403 on every path.
-//      ops.enabled does NOT arm this module (it is a different file name and Ops_Flag is never
-//      called here), and orders.enabled does not arm ops.
-//   2. RefuseIfLive(..., force:false) — the core's one live-order-routing guard. No override.
-//   3. The account: required, matched by name to EXACTLY ONE Account, Provider.Simulator or
-//      Provider.Playback only (Ord_IsSim — a read that throws or returns null refuses), and the
-//      Backtest account refused by name.
+//      cached. Off by default: no code creates it, so the user creates it to opt in, and it stays
+//      armed until the user deletes it. Unarmed -> 403 on every path. ops.enabled does NOT arm this
+//      module (it is a different file name and Ops_Flag is never called here), and orders.enabled
+//      does not arm ops.
+//   2. The account: required, and matched by name to EXACTLY ONE Account.
+//   3. Its provider: Provider.Simulator or Provider.Playback only (Ord_IsSim — a read that throws or
+//      returns null refuses), and the Backtest account refused by name. This gate keeps real money
+//      out of reach, the same way for every verb. Which connections are up does not matter: a broker
+//      connection that can route orders is often the only price feed a Simulator account has, and
+//      this gate already refuses every account that connection owns.
 //   4. Validation: instrument resolves, action/type/TIF from a fixed list, quantity a whole
 //      number >= 1, and exactly the prices the type needs, each finite and > 0.
 //   5. Caps: quantity per order, working orders per account, confirmed submits per minute.
@@ -95,8 +98,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// request, never cached, and never created by this code. It can only move a cap inside the
 		/// ceilings below.</summary>
 		private const string Ord_ConfigName = "orders.config.json";
-
-		private static readonly TimeSpan Ord_FlagMaxAge = TimeSpan.FromHours(24);
 
 		// ── the caps, in ONE block ──────────────────────────────────────────────
 		/// <summary>The default caps: 10 contracts per order / 20 working orders per account / 60 confirmed
@@ -277,10 +278,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 		}
 
 		// ── gate 1: the arming file ─────────────────────────────────────────────
-		/// <summary>Stat orders.enabled NOW — never cached, on every request. True only when the file
-		/// exists AND its last write is inside 24 h and not in the future. Same rule as ops.enabled, its
-		/// OWN file: the two flags never arm each other. A future mtime is ignored because "age &lt;= 24 h"
-		/// is true of every negative number, so one stamped LastWriteTime would arm this for ever.</summary>
+		/// <summary>Stat orders.enabled NOW — never cached, on every request. True when the file exists,
+		/// whatever its age: it stays armed until the user deletes it. Its OWN file: this flag and
+		/// ops.enabled (which has a 24 h limit) never arm each other. The age is reported so an operator
+		/// can see how long the module has been armed.</summary>
 		private static bool Ord_Flag(out double ageHours)
 		{
 			bool armed = false;
@@ -292,14 +293,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 				if (!File.Exists(p)) detail = "absent (" + Ord_FlagName + ")";
 				else
 				{
+					armed = true;
 					ageH = (DateTime.UtcNow - File.GetLastWriteTimeUtc(p)).TotalHours;
-					armed = ageH >= -Ops_ClockSkew.TotalHours && ageH <= Ord_FlagMaxAge.TotalHours;
-					detail = ageH < -Ops_ClockSkew.TotalHours
-						? "IGNORED: mtime is " + (-ageH).ToString("F2", CultureInfo.InvariantCulture)
-							+ " h in the FUTURE — a future stamp must not arm this module for ever"
-						: (armed ? "armed, age " : "STALE (ignored), age ")
-							+ ageH.ToString("F2", CultureInfo.InvariantCulture) + " h of "
-							+ Ord_FlagMaxAge.TotalHours.ToString("F0", CultureInfo.InvariantCulture) + " h";
+					detail = "armed, age " + ageH.ToString("F2", CultureInfo.InvariantCulture)
+						+ " h — delete " + Ord_FlagName + " to disarm";
 				}
 			}
 			catch (Exception ex) { detail = "stat failed: " + Deep(ex) + " — answering NOT armed"; armed = false; }
@@ -317,11 +314,10 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return Obj(
 				P("armed", armed ? "true" : "false"),
 				P("flagName", Q(Ord_FlagName)),
-				P("flagAgeHours", ageHours < 0 ? "null" : D(ageHours)),
-				P("flagMaxAgeHours", D(Ord_FlagMaxAge.TotalHours)));
+				P("flagAgeHours", ageHours < 0 ? "null" : D(ageHours)));
 		}
 
-		// ── gate 3: the account ─────────────────────────────────────────────────
+		// ── gates 2 and 3: the account and its provider ─────────────────────────
 		/// <summary>Simulator or Playback, judged by PROVIDER — never by the account NAME, which is free
 		/// text a human typed and which a funded account can spell "Sim-something". Account.Provider
 		/// first, then the account's Connection's options. When neither can be read the answer is FALSE:
@@ -405,29 +401,14 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// therefore guarded and a null answer falls through to the next test rather than being trusted:
 		/// "manual" is what this returns when nothing identified an owner, not a claim that a human typed
 		/// the order. OrderEntry.Automated is the last resort — it says a NinjaScript sent the order
-		/// without saying which one.</summary>
+		/// without saying which one.
+		///
+		/// A strategy owner reads "strategy &lt;name&gt; #&lt;strategy id&gt; alive|dead": the Id and the
+		/// liveness come from NT8BridgeDesk.cs (Desk_Owner), which also finds the owner of an order whose
+		/// GetOwnerStrategy() answers null by searching every instance's own Orders.</summary>
 		private static string Ord_Owner(Order o)
 		{
-			try { if (string.Equals(o.Name, Ord_OrderName, StringComparison.Ordinal)) return "module"; }
-			catch { }
-			try
-			{
-				var strat = o.GetOwnerStrategy();
-				if (strat is AtmStrategy) return "atm";		// an ATM strategy is the owner strategy of its own orders (observed on 8.1.8.2)
-				if (strat != null)
-				{
-					string n = null;
-					try { n = strat.Name; } catch { }
-					if (string.IsNullOrEmpty(n)) { try { n = strat.GetType().Name; } catch { } }
-					return "strategy " + (string.IsNullOrEmpty(n) ? "(name unreadable)" : n);
-				}
-			}
-			catch { }
-			try { if (o.GetOwnerServerStrategy() != null) return "atm"; }
-			catch { }
-			try { if (o.OrderEntry == OrderEntry.Automated) return "strategy (name unreadable)"; }
-			catch { }
-			return "manual";
+			return Desk_Owner(o).Label;
 		}
 
 		/// <summary>Live orders on this account right now, for the cap. -1 with `error` set when the
@@ -991,8 +972,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return result;
 		}
 
-		/// <summary>The same door for a READ. Gate 1 only: the order-routing guard restricts what can route
-		/// or disturb orders, and listing account names routes nothing. The read reports anyLive itself.</summary>
+		/// <summary>The same door for a READ. Gate 1 only: listing account names routes nothing. The read
+		/// reports anyLive itself.</summary>
 		private static string Ord_GuardedRead(string endpoint, ref int status, Func<Ord_Call, string> read)
 		{
 			double flagAgeHours;
@@ -1020,9 +1001,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 		}
 
 		/// <summary>Gates 2 and 3. null = they passed and `gate` is filled; otherwise the finished refusal
-		/// body, with the status and the audit fields already on `call`. RefuseIfLive runs BEFORE the body
-		/// is parsed — it needs nothing from it, and running it first keeps the chain in a fixed order
-		/// rather than letting a malformed body decide which refusal a caller sees.</summary>
+		/// body, with the status and the audit fields already on `call`.</summary>
 		private static string Ord_OpenGate(Ord_Call call, string verb, string body, out Ord_Gate gate)
 		{
 			gate = null;
@@ -1031,15 +1010,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 			// gate-2 / gate-3 refusals below return before any cap is evaluated.
 			var caps = Ord_Caps();
 			call.Caps = caps;
-
-			int st = 200;
-			string refusal = RefuseIfLive(ref st, "orders " + verb, false);
-			if (refusal != null)
-			{
-				call.Status = st; call.Outcome = "refusedLive";
-				call.Detail = "a live order-routing connection is up";
-				return refusal;
-			}
 
 			Dictionary<string, object> req = Ops_Body(body);
 			string account = Ord_Str(req, "account");
@@ -1298,10 +1268,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// ("module" / "strategy &lt;name&gt;" / "atm" / "manual"). A non-Simulator account is never listed
 		/// — only counted under `hiddenNonSimulator` — and there is NO file that would make it appear.
 		///
-		/// This is a READ and is deliberately not behind RefuseIfLive: the order-routing guard restricts
-		/// what can route or disturb orders, and listing account names routes nothing. It REPORTS anyLive
-		/// and `postsRefused` instead, so an operator can see that every POST would be refused right now
-		/// rather than guessing from a 409.</summary>
+		/// This is a READ: listing account names routes nothing. It reports anyLive (a connection that can
+		/// route orders is up) for information only — no path in this module refuses because of it.</summary>
 		private static string Ord_StatusJson(Ord_Call call)
 		{
 			call.Outcome = "read";
@@ -1381,7 +1349,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return Obj(
 				P("flags", Ord_FlagJson(true, call.FlagAgeHours)),
 				P("anyLive", anyLive ? "true" : "false"),
-				P("postsRefused", anyLive ? "true" : "false"),
 				P("complete", complete ? "true" : "false"),
 				P("error", Q(enumError)),
 				P("accounts", Arr(rows)),
@@ -1415,6 +1382,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			OrderType? type = null;
 			try { type = o.OrderType; } catch { }
 			double limit = Ord_SafeDouble(() => o.LimitPrice), stop = Ord_SafeDouble(() => o.StopPrice);
+			var w = Desk_Owner(o);
 			return Obj(
 				P("orderId", Q(Ord_SafeText(() => o.OrderId))),
 				P("instrument", Q(Ord_SafeText(() => o.Instrument == null ? null : o.Instrument.FullName))),
@@ -1428,7 +1396,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 				P("tif", Q(Ord_SafeText(() => o.TimeInForce.ToString()))),
 				P("oco", Q(Ord_SafeText(() => o.Oco))),
 				P("name", Q(Ord_SafeText(() => o.Name))),
-				P("owner", Q(Ord_Owner(o))));
+				P("owner", Q(w.Label)),
+				Desk_OwnerPairs(w));
 		}
 
 		// ── POST /orders/submit ─────────────────────────────────────────────────
@@ -1956,10 +1925,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 		/// fill price. Runs once per bracket (Interlocked), on the request thread for a Market entry and on
 		/// the watcher thread otherwise, with every lock released.
 		///
-		/// THE EXITS STILL GO OUT WHEN THE MODULE HAS BEEN DISARMED, or when a live order-routing connection
-		/// has come up, since the entry may already have filled: refusing a stop for a filled entry would
-		/// leave the position naked, which is worse than either. What both states change is the NAME of the
-		/// audit line — bracketDisarmed / bracketLiveConnection rather than bracketExits — so the log says
+		/// THE EXITS STILL GO OUT WHEN THE MODULE HAS BEEN DISARMED, since the entry may already have filled:
+		/// refusing a stop for a filled entry would leave the position naked, which is worse. What that
+		/// changes is the NAME of the audit line — bracketDisarmed rather than bracketExits — so the log says
 		/// plainly that this module sent orders after the arming file was taken away.</summary>
 		private static void Ord_BracketExits(Ord_BracketJob br)
 		{
@@ -2042,15 +2010,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (!armed)
 			{
 				outcome = "bracketDisarmed";
-				gateNote = "; THE MODULE WAS NOT ARMED when these exits were sent (" + Ord_FlagName + " is absent, "
-					+ "stale or future-dated) — they went out anyway, because a filled entry with no stop is worse "
-					+ "than a send from a disarmed module. Cancel them by hand if that is not what you wanted";
-			}
-			else if (anyLive)
-			{
-				outcome = "bracketLiveConnection";
-				gateNote = "; a live order-routing connection came up between the entry and these exits — they went "
-					+ "out on this Simulator or Playback account anyway, because the entry was already filled";
+				gateNote = "; THE MODULE WAS NOT ARMED when these exits were sent (" + Ord_FlagName + " is absent)"
+					+ " — they went out anyway, because a filled entry with no stop is worse than a send from a "
+					+ "disarmed module. Cancel them by hand if that is not what you wanted";
 			}
 			Ord_AuditWatch("/orders/bracket", outcome,
 				br.AccountName, br.Instrument, br.Plan,
@@ -2320,6 +2282,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 				P("account", Q(g.AccountName)),
 				P("orderId", Q(call.OrderId)),
 				P("owner", Q(owner)),
+				Desk_OwnerPairs(Desk_Owner(order)),
 				P("instrument", Q(instFull)),
 				P("action", Q(actionText)),
 				P("type", Q(typeText)),

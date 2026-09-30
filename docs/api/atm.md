@@ -11,7 +11,7 @@ the stop and the target itself, on the fill.
 
 **This module owns no safety of its own.** Every path that can change an account goes through the
 one door in `addon/NT8BridgeOrders.cs` — `Ord_Guarded` → `Ord_Approve` → `Ord_Ok` / `Ord_Err` — so
-the arming file, the live-order-routing refusal, the provider test, the caps, the signed one-shot
+the arming file, the account and provider tests, the caps, the signed one-shot
 confirm and the audit log are **the same ones `/orders/*` uses**. Read
 [`docs/api/orders.md`](orders.md) for the gate chain; this document only states what is different
 here. `NT8BridgeAtm.cs` calls no `Ord_Raw…` member and has no live switch: no `ops.live`, no force
@@ -46,11 +46,11 @@ ATM keeps the new price. `/atm/close` closes the position and cancels both exits
 
 ## What is different from `/orders/*`
 
-**The gate chain is identical**, verb for verb: `orders.enabled` (stat-checked every request,
-ignored past 24 h), `RefuseIfLive(…, force:false)` on every POST, the account resolved to exactly
-one `Provider.Simulator` / `Provider.Playback` account with the Backtest account refused by name,
-the caps, the dry run, the signed **one-shot** confirm over the exact plan, and one audit line per
-armed call in `nt8mcp\orders.jsonl` — with the `intent` line written **before** the act.
+**The gate chain is identical**, verb for verb: `orders.enabled` (stat-checked every request, no
+expiry — armed until deleted), the account resolved to exactly one `Provider.Simulator` /
+`Provider.Playback` account with the Backtest account refused by name, the caps, the dry run, the
+signed **one-shot** confirm over the exact plan, and one audit line per armed call in
+`nt8mcp\orders.jsonl` — with the `intent` line written **before** the act.
 
 Three things are specific to this module:
 
@@ -148,7 +148,7 @@ the same answer as `[]`, and only one of them is safe to act on.
 `?account=<name>` restricts it to one account; without it, every valid account is listed.
 
 ```json
-{"anyLive":false,"postsRefused":false,"account":null,
+{"anyLive":false,"account":null,
  "atms":[{"atmId":"1472","template":"MyAtmTemplate","account":"Sim101","instrument":"ES 12-26",
           "state":"Realtime","entryQuantity":1,"calculationMode":"Ticks","active":true,
           "position":{"side":"Long","quantity":1,"averagePrice":5000.25},"positionError":null,
@@ -173,8 +173,8 @@ the same answer as `[]`, and only one of them is safe to act on.
 - **`atms: null`** (with `error` set) means the ATM strategies could not be read, not that there are
   none.
 
-This read is not behind `RefuseIfLive`: it routes nothing. It reports `anyLive` and `postsRefused`
-instead, so an operator can see that every POST would be refused right now.
+This is a read: it routes nothing. It reports `anyLive` — whether a connection that can route
+orders is Connected — for information only; no path in this module refuses because of it.
 
 `StrategyBase.All` loads NinjaTrader's strategy database on its first access in a process, so the
 first `/atm/status` after a restart can take noticeably longer than the ones after it. It is a read,
@@ -308,7 +308,7 @@ still match `from` mean the change has not landed, or was rounded to the instrum
 | 400 | `badRequest` — a missing or malformed field, a template name with a path in it, an action that does not open a position, nothing to change, a `targetIndex` past the last bracket |
 | 403 | `orders module not armed`; `capQuantity` / `capWorkingOrders` / `capRate` / `capCeiling`; `backtestAccount`; `refusedNonSimulator` |
 | 404 | `noSuchAccount`, `noSuchTemplate`, `noSuchAtm` |
-| 409 | `refusedLive`; `ambiguousAccount`; `staleToken` / `confirmMismatch` / `confirmReplayed`; `nothingToClose`; `noStopOrder` / `noTargetOrder`; `changeInFlight` |
+| 409 | `ambiguousAccount`; `staleToken` / `confirmMismatch` / `confirmReplayed`; `nothingToClose`; `noStopOrder` / `noTargetOrder`; `changeInFlight` |
 | 500 | `capUnreadable`, `atmUnreadable` (the ATM's legs, or its bracket list, could not be read), `templateUnreadable`, `auditFailed` — a state that cannot be read is not a state that can be acted on |
 | 502 | the call reached NinjaTrader and failed; the audit line is written either way |
 | 504 | the UI thread did not take `StartAtmStrategy` / `CloseStrategy` within 5 s (audited, then rethrown) |
@@ -334,8 +334,7 @@ log".
    it a small stop and target in ticks.
 2. `GET /atm/templates` while disarmed → `403`. Arm with `type nul > "…\bin\Custom\AddOns\orders.enabled"`,
    then read it again: the template must be listed with its brackets and its `calculationMode`.
-3. Connect **Playback** (or the Simulated Data Feed) so `anyLive` is false, and pick `Sim101` or
-   `Playback101`.
+3. Connect **Playback** (or the Simulated Data Feed), and pick `Sim101` or `Playback101`.
 4. `POST /atm/start` **without** `confirm`. Read the plan: the template name, `templateParams`, the
    caps. Then POST again with that exact `confirm` and `issuedAt`.
 5. Check in NinjaTrader: the entry, and — once it fills — a stop and a target the ATM placed. Then
