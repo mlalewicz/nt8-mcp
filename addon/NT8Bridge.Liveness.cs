@@ -32,7 +32,8 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 		private static string Ord_SafeText(Func<string> f) { try { return f(); } catch { return null; } }
 
-		/// <summary>The order name NT8BridgeOrders.cs puts on every order it submits; an order carrying it is owned by this module.</summary>
+		/// <summary>Account.CreateOrder's `name` argument, on every leg NT8BridgeOrders.cs sends. It is how an
+		/// order's owner reads back as "module" in /orders/status and in a change or cancel plan.</summary>
 		private const string Ord_OrderName = "NT8Bridge";
 
 		// ── liveness by strategy Id ─────────────────────────────────────────────
